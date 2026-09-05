@@ -1,0 +1,335 @@
+{% extends "base.html" %}
+{% block title %}L Notepad{% endblock %}
+{% block page_style %}
+      .wrap { width: 100%; max-width: 1080px; margin: 0 auto; padding: 20px 20px 40px; }
+
+      /* ── Topbar ── */
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 16px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-bottom-color: rgba(91,156,255,0.10);
+        border-radius: 16px;
+        backdrop-filter: blur(20px) saturate(160%);
+        box-shadow: var(--shadow), 0 1px 0 rgba(91,156,255,0.08) inset;
+        position: sticky;
+        top: 12px;
+        z-index: 20;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      .brand-mark {
+        width: 38px;
+        height: 38px;
+        border-radius: 11px;
+        background: linear-gradient(135deg, #5b9cff 0%, #a78bfa 50%, #f472b6 100%);
+        box-shadow: 0 6px 22px rgba(167,100,255,0.38), 0 0 0 1px rgba(255,255,255,0.12) inset;
+        flex-shrink: 0;
+        position: relative;
+        overflow: hidden;
+      }
+      .brand-mark::after {
+        content: "N";
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 18px;
+        color: rgba(255,255,255,0.92);
+        letter-spacing: -0.5px;
+      }
+      .brand-title { font-weight: 700; font-size: 16px; letter-spacing: 0.2px; }
+      .brand-sub { margin-top: 1px; color: var(--muted); font-size: 11px; }
+      .topbar-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      /* ── 状态横幅 ── */
+      .status-banner {
+        margin-top: 18px;
+        padding: 20px 22px;
+        border-radius: 16px;
+        background:
+          radial-gradient(500px 200px at 100% 0%,  rgba(91,156,255,0.14), transparent 65%),
+          radial-gradient(400px 160px at 0% 100%,  rgba(56,212,204,0.07), transparent 60%),
+          linear-gradient(160deg, rgba(14,20,42,0.98), rgba(10,15,30,0.97));
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      .status-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 14px;
+        background: var(--green-soft);
+        border: 1px solid var(--green-border);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 22px;
+        flex-shrink: 0;
+        box-shadow: 0 0 20px rgba(74,222,128,0.18);
+      }
+      .status-body { flex: 1; min-width: 0; }
+      .status-title {
+        font-size: 16px;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 8px rgba(74,222,128,0.65);
+        animation: pulse 2s ease infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50%       { opacity: 0.55; transform: scale(0.8); }
+      }
+      .status-desc {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      /* ── API 信息栏 ── */
+      .api-bar {
+        margin-top: 12px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .api-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 11px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .api-chip .method {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        padding: 2px 6px;
+        border-radius: 5px;
+        background: var(--accent-soft);
+        border: 1px solid rgba(91,156,255,0.24);
+        color: var(--accent-bright);
+      }
+      /* GET → 蓝; UI → 紫 */
+      .api-chip:nth-child(odd) .method {
+        background: var(--violet-soft);
+        border-color: var(--violet-border);
+        color: var(--violet);
+      }
+      .api-chip:nth-child(even) .method {
+        background: var(--cyan-soft);
+        border-color: var(--cyan-border);
+        color: var(--cyan);
+      }
+
+      /* ── 卡片区域标题 ── */
+      .section-head {
+        margin-top: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .section-title {
+        font-size: 14px;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .section-title::before {
+        content: "";
+        width: 3px;
+        height: 14px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, var(--accent), var(--cyan));
+        flex-shrink: 0;
+      }
+      .section-meta { color: var(--muted); font-size: 12px; }
+
+      /* ── 卡片左边色条循环 ── */
+      .card:nth-child(6n+1)  { border-left-color: rgba(91,156,255,0.45); }
+      .card:nth-child(6n+1)::before { background: linear-gradient(90deg, rgba(91,156,255,0.42), transparent 60%); }
+      .card:nth-child(6n+2)  { border-left-color: rgba(56,212,204,0.45); }
+      .card:nth-child(6n+2)::before { background: linear-gradient(90deg, rgba(56,212,204,0.38), transparent 60%); }
+      .card:nth-child(6n+3)  { border-left-color: rgba(167,139,250,0.45); }
+      .card:nth-child(6n+3)::before { background: linear-gradient(90deg, rgba(167,139,250,0.38), transparent 60%); }
+      .card:nth-child(6n+4)  { border-left-color: rgba(251,146,60,0.42); }
+      .card:nth-child(6n+4)::before { background: linear-gradient(90deg, rgba(251,146,60,0.35), transparent 60%); }
+      .card:nth-child(6n+5)  { border-left-color: rgba(74,222,128,0.42); }
+      .card:nth-child(6n+5)::before { background: linear-gradient(90deg, rgba(74,222,128,0.35), transparent 60%); }
+      .card:nth-child(6n+6)  { border-left-color: rgba(244,114,182,0.42); }
+      .card:nth-child(6n+6)::before { background: linear-gradient(90deg, rgba(244,114,182,0.35), transparent 60%); }
+      /* ── 卡片网格 ── */
+      .grid {
+        margin-top: 10px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .card {
+        padding: 12px 14px 11px;
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-left: 3px solid rgba(91,156,255,0.38);
+        border-radius: 12px;
+        box-shadow: var(--shadow-soft);
+        transition: 180ms ease;
+        position: relative;
+        overflow: hidden;
+      }
+      .card::before {
+        content: "";
+        position: absolute;
+        left: 0; top: 0;
+        width: 100%; height: 1px;
+        background: linear-gradient(90deg, rgba(91,156,255,0.45), transparent 60%);
+      }
+      .card:hover {
+        transform: translateY(-2px);
+        border-left-color: rgba(91,156,255,0.75);
+        border-color: rgba(91,156,255,0.28);
+        box-shadow: 0 14px 32px rgba(0,0,0,0.36), 0 0 0 1px rgba(91,156,255,0.10);
+      }
+      .card-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .card-title {
+        font-weight: 600;
+        font-size: 13px;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .time {
+        color: var(--muted);
+        font-size: 11px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .card-owner {
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .empty-icon { font-size: 40px; opacity: 0.5; margin-bottom: 10px; }
+
+      @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+      @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .topbar { flex-direction: column; align-items: stretch; } }
+{% endblock %}
+{% block body %}
+    <div class="wrap">
+      <!-- Topbar -->
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div>
+            <div class="brand-title">L Notepad</div>
+            <div class="brand-sub">后端状态页</div>
+          </div>
+        </div>
+        <div class="topbar-right">
+          {% if login_user %}
+          <div class="login-chip">
+            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
+            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
+          </div>
+          {% endif %}
+          <a class="btn primary" href="{{ web_base }}">进入网页端</a>
+          {% if is_admin %}
+          <a class="btn" href="{{ web_base }}/logs">服务日志</a>
+          {% endif %}
+          <a class="btn" href="{{ root_base }}/docs" target="_blank" rel="noopener">API 文档</a>
+        </div>
+      </div>
+
+      <!-- 状态横幅 -->
+      <div class="status-banner">
+        <div class="status-icon">✓</div>
+        <div class="status-body">
+          <div class="status-title">
+            <span class="status-dot"></span>
+            服务运行正常
+          </div>
+          <div class="status-desc">
+            后端已成功启动。若要查看和编辑日志，请进入
+            <a href="{{ web_base }}" style="color:var(--accent-bright);border-bottom:1px dotted rgba(91,156,255,0.35);">网页前端 /web</a>；
+            若要调试接口，可使用 <code>/docs</code> 或直接访问 REST API。
+          </div>
+        </div>
+      </div>
+
+      <!-- API 信息栏 -->
+      <div class="api-bar">
+        <div class="api-chip"><span class="method">GET</span><code>/api/notes</code></div>
+        <div class="api-chip"><span class="method">GET</span><code>/api/health</code></div>
+        <div class="api-chip"><span class="method">UI</span><code>/web</code> 网页端入口</div>
+        <div class="api-chip"><span class="method">UI</span><code>/docs</code> 接口文档</div>
+      </div>
+
+      <!-- 笔记列表 -->
+      <div class="section-head">
+        <div class="section-title">笔记概览</div>
+        <div class="section-meta">共 {{ notes|length }} 条 · 作者 · 标题 · 时间</div>
+      </div>
+
+      <div class="grid">
+        {% for n in notes %}
+        <div class="card">
+          <div class="card-row">
+            <div class="card-title">
+              {% if n.is_md %}<span class="badge">MD</span>{% endif %}{{ n.title }}
+            </div>
+            <div class="time">{{ n.updated_at }}</div>
+          </div>
+          {% if owner_map.get(n.path) %}
+          <div class="card-owner">👤 {{ owner_map.get(n.path) }}</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+
+      {% if notes|length == 0 %}
+      <div class="empty">
+        <div class="empty-icon">📝</div>
+        <strong style="display:block;margin-bottom:6px;">暂无笔记</strong>
+        <span>打开桌面端新建一条，或前往网页端创建。</span>
+      </div>
+      {% endif %}
+    </div>
+{% endblock %}

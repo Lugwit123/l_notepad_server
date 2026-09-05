@@ -1,0 +1,669 @@
+{% extends "base.html" %}
+{% block title %}知识库 - L Notepad{% endblock %}
+{% block page_style %}
+      .wrap { width: 100%; max-width: none; margin: 0; padding: 10px 12px 12px; }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-bottom-color: rgba(91,156,255,0.10);
+        border-radius: 16px;
+        backdrop-filter: blur(20px) saturate(160%);
+        box-shadow: var(--shadow), 0 1px 0 rgba(91,156,255,0.08) inset;
+        position: sticky;
+        top: 10px;
+        z-index: 20;
+      }
+      .brand { display: flex; align-items: center; gap: 14px; }
+      .brand-mark {
+        width: 40px; height: 40px; border-radius: 12px;
+        background: linear-gradient(135deg, #5b9cff 0%, #a78bfa 50%, #f472b6 100%);
+        box-shadow: 0 6px 22px rgba(167,100,255,0.38), 0 0 0 1px rgba(255,255,255,0.12) inset;
+        flex-shrink: 0; position: relative; overflow: hidden;
+      }
+      .brand-mark::after {
+        content: "K"; position: absolute; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 20px; color: rgba(255,255,255,0.92);
+      }
+      .title { font-weight: 700; letter-spacing: 0.2px; font-size: 16px; }
+      .subtitle { margin-top: 2px; color: var(--muted); font-size: 11px; }
+      .actions { display:flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+      .workspace {
+        margin-top: 10px; display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        gap: 10px; min-height: calc(100vh - 92px);
+      }
+      .sidebar {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+        box-shadow: var(--shadow); overflow: hidden; display: flex; flex-direction: column;
+        position: sticky; top: 74px; max-height: calc(100vh - 84px);
+      }
+      .sidebar-head { padding: 10px 12px; border-bottom: 1px solid rgba(80,120,220,0.10); }
+      .sidebar-title { font-size: 13px; font-weight: 700; }
+      .sidebar-meta { margin-top: 3px; color: var(--muted); font-size: 11px; }
+      .side-scroll { overflow: auto; display: flex; flex-direction: column; min-height: 0; flex: 1; }
+      .side-section { padding: 10px 12px; border-bottom: 1px solid rgba(80,120,220,0.10); }
+      .side-section:last-child { border-bottom: none; }
+      .side-h { font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: 0.05em; margin-bottom: 8px; display: flex; align-items: center; gap: 5px; }
+      .cat-tree { display: flex; flex-direction: column; gap: 3px; }
+      .cat-item {
+        display: flex; align-items: center; gap: 6px; width: 100%;
+        padding: 5px 9px; background: transparent; border: none;
+        border-left: 2px solid transparent; border-radius: 7px;
+        color: var(--muted); font-size: 12px; text-align: left; cursor: pointer;
+        transition: 120ms ease;
+      }
+      .cat-item:hover { background: rgba(91,156,255,0.08); color: var(--text); }
+      .cat-item.active { background: rgba(91,156,255,0.15); border-left-color: var(--accent); color: var(--accent-bright); }
+      .cat-item .cat-icon { font-size: 12px; flex-shrink: 0; }
+      .cat-item .cat-count { margin-left: auto; color: var(--faint); font-size: 10px; }
+      .cat-item .cat-del { margin-left: 4px; color: var(--faint); font-size: 12px; opacity: 0; transition: 120ms ease; }
+      .cat-item:hover .cat-del { opacity: 1; }
+      .cat-item .cat-del:hover { color: var(--danger); }
+      .cat-add { display: flex; gap: 6px; margin-top: 8px; }
+      .cat-add input {
+        flex: 1; background: rgba(8,12,26,0.80); border: 1px solid var(--border);
+        border-radius: 8px; color: var(--text); font-size: 12px; padding: 5px 8px; outline: none;
+      }
+      .cat-add input:focus { border-color: var(--accent-border); }
+      .cat-add .btn { padding: 5px 10px; font-size: 12px; }
+      .content { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+      .content-header {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        padding: 12px 16px; background: var(--panel-strong); border: 1px solid var(--border);
+        border-radius: 12px; box-shadow: var(--shadow-soft);
+      }
+      .content-header-left h2 { margin: 0; font-size: 15px; font-weight: 700; }
+      .content-header-left p { margin: 3px 0 0; font-size: 12px; color: var(--muted); }
+      .article-list { display: flex; flex-direction: column; gap: 8px; }
+      .article-card {
+        display: block; padding: 12px 14px; background: var(--card-bg);
+        border: 1px solid var(--border); border-left: 3px solid rgba(91,156,255,0.40);
+        border-radius: 12px; box-shadow: var(--shadow-soft); transition: 160ms ease;
+      }
+      .article-card:hover { transform: translateY(-1px); border-color: rgba(91,156,255,0.30); border-left-color: var(--accent); }
+      .article-card.active { border-left-color: var(--accent); background: rgba(91,156,255,0.09); }
+      .article-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+      .article-card-title { font-weight: 650; font-size: 14px; }
+      .article-card-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+      .article-card-cat { margin-top: 5px; display: inline-flex; align-items: center; gap: 5px; color: var(--violet); font-size: 11px; }
+      .article-card-snippet { margin-top: 6px; color: rgba(233,238,245,0.78); font-size: 12px; line-height: 1.5; max-height: 3em; overflow: hidden; }
+      .reader {
+        background: var(--panel-strong); border: 1px solid var(--border); border-radius: 14px;
+        box-shadow: var(--shadow); overflow: hidden; display: flex; flex-direction: column; min-height: 420px;
+      }
+      .reader-head { padding: 14px 18px; font-weight: 700; }
+      .reader-meta { margin-top: 6px; color: var(--muted); font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
+      .reader-cat { color: var(--violet); }
+      .reader-body { padding: 18px 22px; overflow-y: auto; max-height: calc(100vh - 240px); }
+      .reader-body.editing { padding: 12px; overflow: hidden; }
+      .markdown-body { font-size: 13px; line-height: 1.75; color: var(--text); word-wrap: break-word; }
+      .markdown-body h1, .markdown-body h2, .markdown-body h3 { margin: 1.2em 0 0.55em; line-height: 1.3; }
+      .markdown-body h1 { font-size: 1.55em; color: var(--accent-bright); }
+      .markdown-body h2 { font-size: 1.32em; }
+      .markdown-body a { color: var(--accent); }
+      .markdown-body code { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); padding: 1px 6px; border-radius: 6px; font-size: 0.92em; }
+      .markdown-body pre { background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
+      .markdown-body pre code { background: transparent; border: none; padding: 0; }
+      .reader-empty { padding: 80px 20px; text-align: center; color: var(--muted); }
+      .reader-empty .ico { font-size: 44px; margin-bottom: 12px; opacity: 0.55; }
+      .article-actions { display: flex; gap: 6px; }
+      .btn.sm { padding: 4px 10px; font-size: 12px; }
+      .btn.danger { background: var(--danger-soft); border-color: var(--danger-border); color: var(--danger); }
+      .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      .ws-panel {
+        margin-top: 10px; display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr);
+        gap: 10px; height: calc(100vh - 118px);
+      }
+      .ws-panel .sidebar { height: 100%; min-height: 0; max-height: none; position: static; overflow: hidden; }
+      .ws-panel .side-scroll { flex: 1; min-height: 0; overflow: auto; }
+      .ws-panel .reader-body { max-height: none; }
+      .ws-item { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 9px; background: transparent; border: none; border-radius: 7px; color: var(--muted); font-size: 12px; text-align: left; cursor: pointer; transition: 120ms ease; }
+      .ws-item:hover { background: rgba(91,156,255,0.08); color: var(--text); }
+      .ws-item.active { background: rgba(91,156,255,0.15); color: var(--accent-bright); }
+      .ws-item .ws-ico { font-size: 12px; flex-shrink: 0; }
+      .ws-item .ws-size { margin-left: auto; color: var(--faint); font-size: 10px; flex-shrink: 0; }
+      .ws-folder {
+        display: flex; align-items: center; gap: 6px; width: 100%;
+        padding: 4px 9px; background: transparent; border: none; border-radius: 7px;
+        color: var(--muted); font-size: 12px; text-align: left; cursor: pointer;
+        transition: 120ms ease; user-select: none;
+      }
+      .ws-folder:hover { background: rgba(91,156,255,0.08); color: var(--text); }
+      .ws-folder .ws-ico { font-size: 12px; flex-shrink: 0; }
+      .ws-folder .ws-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .ws-folder .ws-size { margin-left: auto; color: var(--faint); font-size: 10px; flex-shrink: 0; }
+      .ws-cloud { color: var(--cyan); font-size: 11px; display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; margin-left: 8px; }
+      .ws-cloud.local { color: var(--faint); }
+      .ws-cloud .v { color: var(--accent-bright); font-weight: 700; }
+      .ws-note-share { color: #c678dd; font-size: 11px; display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; margin-left: 8px; }
+      .ws-menu { position: fixed; z-index: 1000; min-width: 260px; max-width: 360px; background: var(--panel-strong); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 8px; font-size: 12px; }
+      .ws-menu-title { padding: 2px 4px 7px; font-weight: 700; border-bottom: 1px solid var(--border); margin-bottom: 7px; word-break: break-all; }
+      .ws-menu-row { padding: 3px 4px; color: var(--muted); word-break: break-all; line-height: 1.6; }
+      .ws-menu-row code { font-size: 11px; color: var(--text); }
+      .ws-menu .btn { margin-top: 7px; width: 100%; }
+      @media (max-width: 920px) { .workspace { grid-template-columns: 92px minmax(0,1fr); } .sidebar-title, .sidebar-meta { display: none; } }
+      @media (max-width: 860px) {
+        .workspace { grid-template-columns: 1fr; min-height: auto; }
+        .sidebar { position: static; max-height: 260px; }
+        .topbar { flex-direction: column; align-items: stretch; }
+        .actions { justify-content: space-between; }
+      }
+{% endblock %}
+{% block body %}
+    <div class="wrap">
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark">K</div>
+          <div>
+            <div class="title">{{ kb.title }}</div>
+            <div class="subtitle">工作区笔记 · 百度云版本库 /{{ kb.name }}</div>
+          </div>
+        </div>
+        <div class="actions">
+          {% if login_user %}
+          <div class="login-chip">
+            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
+            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
+          </div>
+          {% endif %}
+          <a class="btn" href="{{ web_base }}/kb">← 知识库</a>
+          <a class="btn" href="{{ web_base }}">← 网页端</a>
+        </div>
+      </div>
+
+      <div class="ws-panel" id="ws-panel">
+        <aside class="sidebar">
+          <div class="sidebar-head">
+            <div class="sidebar-title">工作区笔记</div>
+            <div class="sidebar-meta" id="ws-meta">加载中…</div>
+          </div>
+          <div class="side-scroll">
+            <div class="side-section">
+              <div class="side-h">本机工作区 + 云端</div>
+              <div class="cat-tree" id="ws-tree"></div>
+            </div>
+          </div>
+        </aside>
+        <main class="content">
+          <div class="content-header">
+            <div class="content-header-left">
+              <h2 id="ws-title">工作区笔记</h2>
+              <p id="ws-sub">选择左侧笔记预览</p>
+            </div>
+            <div class="article-actions">
+              <button class="btn sm primary" type="button" id="btn-ws-upload">➕ 上传本地文件</button>
+              <button class="btn sm" type="button" id="btn-ws-set">设置工作区</button>
+              <button class="btn sm" type="button" id="btn-ws-edit" style="display:none;">✏ 编辑</button>
+              <button class="btn sm danger" type="button" id="btn-ws-submit" style="display:none;">⬆ 提交为新版本</button>
+            </div>
+          </div>
+          <div class="reader">
+            <div class="reader-head">
+              <div class="reader-title" id="ws-reader-title">选择工作区笔记</div>
+              <div class="reader-meta" id="ws-reader-meta"></div>
+            </div>
+            <div class="reader-body">
+              <textarea id="ws-editor" style="display:none; width:100%; height:calc(100vh - 300px); min-height:420px; resize:vertical; box-sizing:border-box; background:rgba(8,12,26,0.85); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:14px 16px; font-family:Consolas,Menlo,monospace; font-size:13px; line-height:1.7; outline:none; tab-size:4;"></textarea>
+              <div class="markdown-body" id="ws-reader-body">
+                <div class="reader-empty"><div class="ico">📄</div>选择左侧笔记开始预览</div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+    <div id="ws-menu" style="display:none;"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block page_script %}
+    <script src="{{ _mounted_url(request, 'static/purify.min.js') }}"></script>
+    <script src="{{ _mounted_url(request, 'static/marked.umd.min.js') }}"></script>
+    <script>
+      (function () {
+        const root = "{{ root_base }}";
+        const kbName = "{{ kb.name }}";
+        const wsTree = document.getElementById("ws-tree");
+        const wsMeta = document.getElementById("ws-meta");
+        const toastEl = document.getElementById("toast");
+        let wsFiles = [];
+        let wsActiveRel = null;
+        let wsPath = "";
+        let cloudMap = {};
+        let statusMap = {};
+        let sharedMap = {};
+        let contentCache = {};
+        let wsEditMode = false;
+        let wsEditContent = "";
+        let wsEditMeta = "";
+
+        function toast(msg, type) {
+          if (!toastEl) return;
+          toastEl.textContent = msg;
+          toastEl.className = "show " + (type || "success");
+          clearTimeout(toastEl._t);
+          toastEl._t = setTimeout(function () { toastEl.className = ""; }, 2400);
+        }
+
+        function api(path, opts) {
+          return fetch(root + path, opts).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          });
+        }
+
+        function fmtSize(n) {
+          n = n || 0;
+          if (n < 1024) return n + "B";
+          if (n < 1048576) return (n / 1024).toFixed(0) + "K";
+          return (n / 1048576).toFixed(1) + "M";
+        }
+
+        function getLocalContent(rel) {
+          return api("/api/kb/" + kbName + "/workspace/file?path=" + encodeURIComponent(rel))
+            .then(function (r) { return r.content || ""; });
+        }
+
+        function getCloudContent(rel) {
+          const path = "/" + kbName + "/" + rel;
+          return fetch("/baidu/api/depot/download?path=" + encodeURIComponent(path) + "&rev=0")
+            .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); });
+        }
+
+        function cmpContent(a, b) {
+          return (a || "") === (b || "");
+        }
+
+        function reconcileStatus(cb) {
+          const localByRel = {};
+          (wsFiles || []).forEach(function (f) { localByRel[f.rel] = f; });
+          statusMap = {};
+          const rels = {};
+          Object.keys(cloudMap).forEach(function (r) { rels[r] = 1; });
+          Object.keys(localByRel).forEach(function (r) { rels[r] = 1; });
+          const allRels = Object.keys(rels);
+          const need = allRels.filter(function (r) {
+            return cloudMap[r] && localByRel[r];
+          });
+          if (!need.length) { finishStatus(allRels, cb); return; }
+          let pending = need.length;
+          need.forEach(function (rel) {
+            Promise.all([getLocalContent(rel), getCloudContent(rel)])
+              .then(function (res) {
+                statusMap[rel] = { modified: !cmpContent(res[0], res[1]) };
+              })
+              .catch(function () { statusMap[rel] = { modified: false }; })
+              .then(function () { if (--pending === 0) finishStatus(allRels, cb); });
+          });
+
+          function finishStatus(rels, cb) {
+            rels.forEach(function (r) {
+              if (statusMap[r]) return;
+              if (cloudMap[r] && localByRel[r]) statusMap[r] = { modified: false };
+              else if (cloudMap[r]) statusMap[r] = { cloudOnly: true };
+              else statusMap[r] = { localOnly: true };
+            });
+            if (cb) cb();
+          }
+        }
+
+        function loadCloudStatus(cb) {
+          cloudMap = {};
+          const depotBase = "/" + kbName;
+          function dl(dir, done) {
+            fetch("/baidu/api/depot/list?dir=" + encodeURIComponent(dir))
+              .then(function (r) { if (!r.ok) return done(); return r.json(); })
+              .then(function (j) {
+                const items = (j && j.items) || [];
+                const dirs = [];
+                items.forEach(function (i) {
+                  if (i.isdir) dirs.push(i.path);
+                  else {
+                    const rel = i.path.slice(depotBase.length).replace(/^\/+/, "");
+                    cloudMap[rel] = { rev: i.rev, path: i.path, remote_path: i.remote_path || "" };
+                  }
+                });
+                if (!dirs.length) return done();
+                let pending = dirs.length;
+                dirs.forEach(function (d) {
+                  dl(d, function () { if (--pending === 0) done(); });
+                });
+              })
+              .catch(function () { done(); });
+          }
+          dl(depotBase, cb || function () {});
+        }
+
+        const folderOpen = {};
+
+        function buildWsTree(rels) {
+          const root = { name: "", path: "", children: [], files: [] };
+          rels.forEach(function (rel) {
+            const parts = rel.split("/");
+            let node = root;
+            let cur = "";
+            for (let i = 0; i < parts.length - 1; i++) {
+              cur = cur ? cur + "/" + parts[i] : parts[i];
+              let child = null;
+              for (let j = 0; j < node.children.length; j++) {
+                if (node.children[j].path === cur) { child = node.children[j]; break; }
+              }
+              if (!child) {
+                child = { name: parts[i], path: cur, children: [], files: [] };
+                node.children.push(child);
+              }
+              node = child;
+            }
+            node.files.push(rel);
+          });
+          const sortNode = function (n) {
+            n.children.sort(function (a, b) { return a.name.localeCompare(b.name); });
+            n.files.sort(function (a, b) { return a.localeCompare(b); });
+            n.children.forEach(sortNode);
+          };
+          sortNode(root);
+          return root;
+        }
+
+        function wsCountFiles(node) {
+          let n = node.files.length;
+          node.children.forEach(function (c) { n += wsCountFiles(c); });
+          return n;
+        }
+
+        function makeWsItem(rel, depth) {
+          const st = statusMap[rel] || {};
+          const cloud = cloudMap[rel];
+          const btn = document.createElement("button");
+          btn.className = "ws-item" + (rel === wsActiveRel ? " active" : "");
+          btn.style.paddingLeft = (9 + depth * 16) + "px";
+          let ico, badge, ttl;
+          if (st.cloudOnly) {
+            ico = "☁"; badge = '<span class="ws-cloud">云端</span>';
+            ttl = "百度云地址：" + (cloud.remote_path || cloud.path) + " · 版本 #" + cloud.rev;
+          } else if (st.localOnly) {
+            ico = "📄"; badge = '<span class="ws-cloud local">仅本地</span>';
+            ttl = "本机工作区文件，尚未上传";
+          } else if (st.modified) {
+            ico = "✎"; badge = '<span class="ws-cloud">已修改</span>';
+            ttl = "本机已修改，未同步 · 百度云 #" + cloud.rev;
+          } else {
+            ico = "✓"; badge = '<span class="ws-cloud">已同步 #' + cloud.rev + '</span>';
+            ttl = "已与云端一致 · 百度云 #" + cloud.rev;
+          }
+          btn.innerHTML = '<span class="ws-ico">' + ico + '</span><span>' + LN.esc(rel) + '</span>' + badge + (sharedMap[rel] ? '<span class="ws-note-share">📎 来自个人笔记</span>' : '');
+          btn.title = ttl;
+          btn.onclick = function () { openWsFile(rel); };
+          btn.oncontextmenu = function (e) { e.preventDefault(); showWsMenu(rel, e.clientX, e.clientY); };
+          return btn;
+        }
+
+        function renderWsNode(node, depth) {
+          node.children.forEach(function (child) {
+            const isOpen = folderOpen[child.path] !== false;
+            const row = document.createElement("button");
+            row.type = "button";
+            row.className = "ws-folder";
+            row.style.paddingLeft = (9 + depth * 16) + "px";
+            row.innerHTML = '<span class="ws-ico">' + (isOpen ? "📂" : "📁") + '</span><span class="ws-name">' + LN.esc(child.name) + '</span><span class="ws-size">' + wsCountFiles(child) + '</span>';
+            row.title = child.path + "（点击展开/折叠）";
+            row.onclick = function () {
+              folderOpen[child.path] = !isOpen;
+              renderWsTree();
+            };
+            row.oncontextmenu = function (e) { e.preventDefault(); showFolderMenu(child.path, e.clientX, e.clientY); };
+            wsTree.appendChild(row);
+            if (isOpen) renderWsNode(child, depth + 1);
+          });
+          node.files.forEach(function (rel) {
+            wsTree.appendChild(makeWsItem(rel, depth));
+          });
+        }
+
+        function renderWsTree() {
+          wsTree.textContent = "";
+          const rels = Object.keys(statusMap).sort();
+          if (!rels.length) {
+            wsTree.innerHTML = '<div class="reader-empty">暂无笔记<br>点击右上角「上传本地文件」或设置工作区</div>';
+            return;
+          }
+          renderWsNode(buildWsTree(rels), 0);
+          wsMeta.textContent = rels.length + " 篇";
+        }
+
+        function loadWorkspace() {
+          loadCloudStatus(function () {
+            api("/api/kb/" + kbName + "/workspace").then(function (r) {
+              wsPath = r.workspace || "";
+              wsFiles = r.files || [];
+              sharedMap = {};
+              (wsFiles || []).forEach(function (f) { if (f.shared) sharedMap[f.rel] = true; });
+              reconcileStatus(renderWsTree);
+            }).catch(function () {});
+          });
+        }
+
+        function openWsFile(rel) {
+          wsActiveRel = rel;
+          exitEditMode();
+          renderWsTree();
+          const st = statusMap[rel] || {};
+          const cloud = cloudMap[rel];
+          const render = function (raw, meta) {
+            wsEditContent = raw || "";
+            wsEditMeta = meta;
+            document.getElementById("ws-reader-title").textContent = rel;
+            document.getElementById("ws-reader-meta").textContent = meta;
+            document.getElementById("btn-ws-edit").style.display = st.cloudOnly ? "none" : "inline-flex";
+            document.getElementById("btn-ws-submit").style.display = (st.localOnly || st.modified) ? "inline-flex" : "none";
+            const body = document.getElementById("ws-reader-body");
+            const html = window.marked && typeof window.marked.parse === "function" ? window.marked.parse(raw || "") : "<pre>" + LN.esc(raw || "") + "</pre>";
+            body.innerHTML = window.DOMPurify && typeof window.DOMPurify.sanitize === "function" ? window.DOMPurify.sanitize(html) : html;
+            document.getElementById("ws-sub").textContent = (st.localOnly ? "本机文件 · " : "云端文章 · ") + rel;
+          };
+          const cloudMeta = "版本 #" + (cloud ? cloud.rev : 0);
+          if (!st.cloudOnly && wsFiles.some(function (f) { return f.rel === rel; })) {
+            getLocalContent(rel)
+              .then(function (text) {
+                render(text, (st.modified ? "本机已修改 · " : "已同步 · ") + cloudMeta);
+              })
+              .catch(function () {
+                fetchCloud();
+              });
+            return;
+          }
+          fetchCloud();
+          function fetchCloud() {
+            fetch("/baidu/api/depot/download?path=" + encodeURIComponent("/" + kbName + "/" + rel) + "&rev=0")
+              .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+              .then(function (text) { render(text, cloudMeta); })
+              .catch(function (e) { toast("读取失败：" + e.message, "error"); });
+          }
+        }
+
+        function enterEditMode() {
+          if (!wsActiveRel || statusMap[wsActiveRel].cloudOnly) return;
+          wsEditMode = true;
+          const body = document.getElementById("ws-reader-body");
+          const ed = document.getElementById("ws-editor");
+          body.style.display = "none";
+          ed.style.display = "block";
+          ed.value = wsEditContent;
+          ed.focus();
+          document.getElementById("ws-reader-title").textContent = "编辑：" + wsActiveRel;
+          const btn = document.getElementById("btn-ws-edit");
+          btn.textContent = "💾 保存";
+          btn.classList.add("primary");
+          document.getElementById("ws-reader-body").parentElement.classList.add("editing");
+        }
+
+        function exitEditMode() {
+          if (!wsEditMode) return;
+          wsEditMode = false;
+          const body = document.getElementById("ws-reader-body");
+          const ed = document.getElementById("ws-editor");
+          body.style.display = "";
+          ed.style.display = "none";
+          document.getElementById("ws-reader-body").parentElement.classList.remove("editing");
+          const btn = document.getElementById("btn-ws-edit");
+          btn.textContent = "✏ 编辑";
+          btn.classList.remove("primary");
+        }
+
+        function saveEdited() {
+          if (!wsActiveRel || !wsEditMode) return;
+          const newContent = document.getElementById("ws-editor").value;
+          api("/api/kb/" + kbName + "/workspace/file?path=" + encodeURIComponent(wsActiveRel), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: newContent })
+          }).then(function () {
+            toast("已保存到工作区 ✓");
+            exitEditMode();
+            statusMap[wsActiveRel] = { modified: true };
+            loadCloudStatus(function () { reconcileStatus(renderWsTree); });
+            openWsFile(wsActiveRel);
+          }).catch(function (e) { toast("保存失败：" + e.message, "error"); });
+        }
+        document.getElementById("btn-ws-edit").addEventListener("click", function () {
+          if (wsEditMode) saveEdited(); else enterEditMode();
+        });
+
+        function submitToBaidu(rel) {
+          const target = rel || wsActiveRel;
+          if (!target) return;
+          const st = statusMap[target] || {};
+          if (st.cloudOnly) { toast("该笔记仅在云端，无需提交", "info"); return; }
+          if (!st.modified && !st.localOnly) {
+            toast("该笔记未修改，跳过上传", "info");
+            return;
+          }
+          if (!confirm("将工作区文件提交到百度云版本库？\n" + target)) return;
+          getLocalContent(target).then(function (content) {
+            const depotPath = "/" + kbName + "/" + target;
+            const desc = "提交 " + target;
+            return fetch("/baidu/api/depot/submit_stream?path=" + encodeURIComponent(depotPath) + "&description=" + encodeURIComponent(desc), {
+              method: "POST",
+              headers: { "Content-Type": "application/octet-stream" },
+              body: content
+            }).then(function (resp) {
+              if (!resp.ok) return resp.text().then(function (t) { throw new Error("HTTP " + resp.status + " " + t); });
+              return resp.json();
+            });
+          }).then(function () {
+            toast("已提交到百度云 ✓");
+            loadCloudStatus(function () {
+              reconcileStatus(renderWsTree);
+            });
+          }).catch(function (e) { toast("提交失败：" + e.message, "error"); });
+        }
+        document.getElementById("btn-ws-submit").addEventListener("click", function () { submitToBaidu(wsActiveRel); });
+
+        document.getElementById("btn-ws-upload").addEventListener("click", function () {
+          if (!wsFiles.length) { toast("请先设置工作区（工作区需有 .md 文档）", "error"); return; }
+          const local = wsFiles.filter(function (f) {
+            const st = statusMap[f.rel] || {};
+            return st.localOnly || st.modified;
+          });
+          if (!local.length) {
+            toast("所有本地文档均已同步到云端，无需上传", "info");
+            return;
+          }
+          const msg = "选择要上传的本地文件（仅本地或已修改）：\n\n" +
+            local.map(function (f, i) { return (i + 1) + ". " + f.rel; }).join("\n") +
+            "\n\n输入编号：";
+          const input = prompt(msg, "1");
+          const idx = parseInt(input, 10) - 1;
+          if (isNaN(idx) || idx < 0 || idx >= local.length) return;
+          submitToBaidu(local[idx].rel);
+        });
+
+        document.getElementById("btn-ws-set").addEventListener("click", function () {
+          const p = prompt("设置该知识库的工作区目录（本地绝对路径，如 D:\\...\\Rez-Docs）：", wsPath);
+          if (p === null) return;
+          api("/api/kb/" + kbName + "/workspace", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspace: p })
+          }).then(function () {
+            toast("工作区已更新");
+            loadWorkspace();
+          }).catch(function (e) { toast("设置失败：" + e.message, "error"); });
+        });
+
+        const wsMenu = document.getElementById("ws-menu");
+        wsMenu.className = "ws-menu";
+        function showFolderMenu(rel, x, y) {
+          let rows = '<div class="ws-menu-title">📁 ' + LN.esc(rel) + '</div>';
+          rows += '<div class="ws-menu-row">工作区目录</div>';
+          rows += '<button class="btn sm" type="button" data-reveal="' + LN.esc(rel) + '">📂 打开文件所在目录</button>';
+          wsMenu.innerHTML = rows;
+          wsMenu.style.display = "block";
+          const mw = wsMenu.offsetWidth, mh = wsMenu.offsetHeight;
+          wsMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - mw - 8)) + "px";
+          wsMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - mh - 8)) + "px";
+        }
+        function showWsMenu(rel, x, y) {
+          const cloud = cloudMap[rel];
+          const st = statusMap[rel] || {};
+          const path = "/" + kbName + "/" + rel;
+          const phys = cloud && cloud.remote_path ? cloud.remote_path : "";
+          const shown = phys || path;
+          let rows = '<div class="ws-menu-title">' + (st.cloudOnly ? "☁" : st.localOnly ? "📄" : st.modified ? "✎" : "✓") + ' ' + LN.esc(rel) + '</div>';
+          rows += '<div class="ws-menu-row">状态：<code>' + (st.cloudOnly ? "仅云端" : st.localOnly ? "仅本地" : st.modified ? "本机已修改" : "已同步") + '</code></div>';
+          if (cloud) {
+            rows += '<div class="ws-menu-row">版本 <span class="v">#' + cloud.rev + '</span></div>';
+            rows += phys
+              ? '<div class="ws-menu-row">百度云物理路径：<code>' + LN.esc(phys) + '</code></div>'
+              : '<div class="ws-menu-row">百度云地址：<code>' + LN.esc(path) + '</code></div>';
+            rows += '<button class="btn sm" type="button" data-copy="' + LN.esc(shown) + '">📋 复制百度云地址</button>';
+          } else {
+            rows += '<div class="ws-menu-row">预期地址：<code>' + LN.esc(path) + '</code></div>';
+          }
+          if (st.localOnly || st.modified) {
+            rows += '<button class="btn sm primary" type="button" data-submit="' + LN.esc(rel) + '">⬆ 提交到百度云</button>';
+          } else {
+            rows += '<div class="ws-menu-row">未修改，无需上传</div>';
+          }
+          rows += '<button class="btn sm" type="button" data-reveal="' + LN.esc(rel) + '">📂 打开文件所在目录</button>';
+          wsMenu.innerHTML = rows;
+          wsMenu.style.display = "block";
+          const mw = wsMenu.offsetWidth, mh = wsMenu.offsetHeight;
+          wsMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - mw - 8)) + "px";
+          wsMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - mh - 8)) + "px";
+        }
+        document.addEventListener("click", function () { wsMenu.style.display = "none"; });
+        wsMenu.addEventListener("click", function (e) {
+          const copy = e.target.closest("[data-copy]");
+          const submit = e.target.closest("[data-submit]");
+          const reveal = e.target.closest("[data-reveal]");
+          if (copy) {
+            const text = copy.getAttribute("data-copy");
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(function () { toast("已复制百度云地址"); });
+            } else { toast("地址：" + text, "info"); }
+            wsMenu.style.display = "none";
+          } else if (submit) {
+            wsMenu.style.display = "none";
+            submitToBaidu(submit.getAttribute("data-submit"));
+          } else if (reveal) {
+            wsMenu.style.display = "none";
+            api("/api/kb/" + kbName + "/workspace/reveal?path=" + encodeURIComponent(reveal.getAttribute("data-reveal")))
+              .then(function () { toast("已在资源管理器中打开目录"); })
+              .catch(function (err) { toast("打开失败：" + err.message, "error"); });
+          }
+        });
+
+        loadWorkspace();
+        LN.fmtAll();
+      })();
+
+    </script>
+{% endblock %}

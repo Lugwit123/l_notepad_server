@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}L Notepad{% endblock %}</title>
+    <link rel="icon" href="{{ root_base }}/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="{{ _mounted_url(request, 'static/app.css') }}" />
+    {% block head %}{% endblock %}
+    <style>
+      {% block page_style %}{% endblock %}
+    </style>
+  </head>
+  <body data-root="{{ root_base }}" data-web="{{ web_base }}">
+    {% block body %}{% endblock %}
+    <script src="{{ _mounted_url(request, 'static/app.js') }}"></script>
+    {% block page_script %}{% endblock %}
+  </body>
+</html>

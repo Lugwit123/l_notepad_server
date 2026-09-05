@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}知识库 - L Notepad{% endblock %}
+{% block page_style %}
+      .wrap { width: 100%; max-width: 1080px; margin: 0 auto; padding: 18px 16px 24px; }
+      .topbar {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        padding: 12px 16px; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 16px; box-shadow: var(--shadow); margin-bottom: 16px;
+      }
+      .brand { display: flex; align-items: center; gap: 14px; }
+      .brand-mark {
+        width: 42px; height: 42px; border-radius: 12px;
+        background: linear-gradient(135deg, #5b9cff 0%, #a78bfa 50%, #f472b6 100%);
+        box-shadow: 0 6px 22px rgba(167,100,255,0.38);
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 20px; color: rgba(255,255,255,0.92);
+      }
+      .title { font-weight: 700; font-size: 16px; }
+      .subtitle { margin-top: 2px; color: var(--muted); font-size: 11px; }
+      .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+      .kb-card {
+        display: block; padding: 16px 18px; background: var(--card-bg);
+        border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow-soft);
+        text-decoration: none; color: var(--text); transition: 160ms ease;
+      }
+      .kb-card:hover { transform: translateY(-2px); border-color: rgba(91,156,255,0.35); }
+      .kb-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .kb-name { font-weight: 700; font-size: 15px; }
+      .kb-title { margin-top: 6px; color: rgba(233,238,245,0.85); font-size: 13px; }
+      .kb-desc { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.5; min-height: 2.6em; }
+      .kb-meta { margin-top: 10px; display: flex; gap: 12px; color: var(--muted); font-size: 11px; }
+      .kb-meta .num { color: var(--accent-bright); font-weight: 700; }
+      .kb-card .del {
+        background: transparent; border: 1px solid var(--border); border-radius: 7px;
+        color: var(--muted); font-size: 12px; padding: 3px 9px; cursor: pointer;
+      }
+      .kb-card .del:hover { color: var(--danger); border-color: var(--danger-border); background: var(--danger-soft); }
+      .create-panel {
+        margin-top: 20px; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 14px; padding: 16px;
+      }
+      .create-panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 700; }
+      .create-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .create-row input {
+        flex: 1; min-width: 140px; background: rgba(8,12,26,0.80); border: 1px solid var(--border);
+        border-radius: 8px; color: var(--text); font-size: 12px; padding: 6px 10px; outline: none;
+      }
+      .create-row input:focus { border-color: var(--accent-border); }
+      .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+{% endblock %}
+{% block body %}
+    <div class="wrap">
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark">K</div>
+          <div>
+            <div class="title">知识库</div>
+            <div class="subtitle">每个知识库有自己的路由，内含多篇文章与目录层级</div>
+          </div>
+        </div>
+        <div class="actions">
+          {% if login_user %}
+          <div class="login-chip">
+            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
+            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
+          </div>
+          {% endif %}
+          <a class="btn" href="{{ web_base }}">← 网页端</a>
+        </div>
+      </div>
+
+      <div class="grid" id="kb-grid"></div>
+
+      <div class="create-panel">
+        <h3>➕ 新建知识库</h3>
+        <div class="create-row">
+          <input id="kb-name" type="text" placeholder="名称（路由键，如 tech-docs）" maxlength="80" />
+          <input id="kb-title" type="text" placeholder="展示名（可留空用名称）" maxlength="80" />
+          <input id="kb-desc" type="text" placeholder="简介（可选）" maxlength="200" />
+          <button class="btn primary" type="button" id="btn-create">创建</button>
+        </div>
+      </div>
+    </div>
+    <div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block page_script %}
+    <script>
+      (function () {
+        const root = "{{ root_base }}";
+        const grid = document.getElementById("kb-grid");
+        const toastEl = document.getElementById("toast");
+        function toast(msg, type) {
+          if (!toastEl) return;
+          toastEl.textContent = msg;
+          toastEl.className = "show " + (type || "success");
+          clearTimeout(toastEl._t);
+          toastEl._t = setTimeout(function () { toastEl.className = ""; }, 2400);
+        }
+        function api(path, opts) {
+          return fetch(root + path, opts).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          });
+        }
+        function render(list) {
+          grid.textContent = "";
+          if (!list.length) {
+            const empty = document.createElement("div");
+            empty.className = "empty";
+            empty.innerHTML = "<strong>还没有知识库</strong><br>在下方创建第一个知识库。";
+            grid.appendChild(empty);
+            return;
+          }
+          list.forEach(function (b) {
+            const a = document.createElement("a");
+            a.className = "kb-card";
+            a.href = root + "/web/kb/" + encodeURIComponent(b.name);
+            a.innerHTML =
+              '<div class="kb-card-head"><span class="kb-name">' + LN.esc(b.title || b.name) + '</span>' +
+                '<button type="button" class="del" data-name="' + LN.esc(b.name) + '">删除</button></div>' +
+              '<div class="kb-title">' + LN.esc(b.name) + '</div>' +
+              (b.description ? '<div class="kb-desc">' + LN.esc(b.description) + '</div>' : '') +
+              '<div class="kb-meta"><span>📚 <span class="num">' + b.article_count + '</span> 篇文章</span>' +
+              '<span>📂 <span class="num">' + b.category_count + '</span> 个层级</span></div>';
+            const del = a.querySelector(".del");
+            del.addEventListener("click", function (e) {
+              e.preventDefault();
+              e.stopPropagation();
+              if (!confirm("确定删除知识库「" + b.title + "」及其全部文章？")) return;
+              api("/api/kb/bases/" + encodeURIComponent(b.name), { method: "DELETE" })
+                .then(function (d) { toast("已删除"); render(d.bases); })
+                .catch(function (e) { toast("删除失败：" + e.message, "error"); });
+            });
+            grid.appendChild(a);
+          });
+        }
+        function load() {
+          api("/api/kb/bases").then(function (d) { render(d.bases || []); })
+            .catch(function (e) { toast("加载失败：" + e.message, "error"); });
+        }
+        document.getElementById("btn-create").addEventListener("click", function () {
+          const name = document.getElementById("kb-name").value.trim();
+          const title = document.getElementById("kb-title").value.trim();
+          const desc = document.getElementById("kb-desc").value.trim();
+          if (!name) { toast("请填写名称", "error"); return; }
+          api("/api/kb/bases", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name, title: title, description: desc })
+          }).then(function (d) {
+            document.getElementById("kb-name").value = "";
+            document.getElementById("kb-title").value = "";
+            document.getElementById("kb-desc").value = "";
+            toast("已创建知识库");
+            render(d.bases);
+          }).catch(function (e) { toast("创建失败：" + e.message, "error"); });
+        });
+        load();
+        LN.fmtAll();
+      })();
+    </script>
+{% endblock %}

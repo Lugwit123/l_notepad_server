@@ -1,0 +1,508 @@
+{% extends "base.html" %}
+{% block title %}服务日志 - L Notepad{% endblock %}
+{% block page_style %}
+      .wrap { width: 100%; max-width: none; margin: 0; padding: 10px 12px 12px; }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-bottom-color: rgba(91, 156, 255, 0.10);
+        border-radius: 16px;
+        backdrop-filter: blur(20px) saturate(160%);
+        box-shadow: var(--shadow), 0 1px 0 rgba(91,156,255,0.08) inset;
+        position: sticky;
+        top: 10px;
+        z-index: 20;
+      }
+      .brand { display: flex; align-items: center; gap: 14px; }
+      .brand-mark {
+        width: 40px; height: 40px; border-radius: 12px;
+        background: linear-gradient(135deg, #5b9cff 0%, #a78bfa 50%, #f472b6 100%);
+        box-shadow: 0 6px 22px rgba(167, 100, 255, 0.38), 0 0 0 1px rgba(255,255,255,0.12) inset;
+        flex-shrink: 0; position: relative; overflow: hidden;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 20px; color: rgba(255,255,255,0.92);
+      }
+      .title { font-weight: 700; letter-spacing: 0.2px; font-size: 16px; }
+      .subtitle { margin-top: 2px; color: var(--muted); font-size: 11px; }
+      .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+
+      .workspace {
+        margin-top: 10px;
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr);
+        gap: 10px;
+        min-height: calc(100vh - 92px);
+      }
+      .sidebar {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        position: sticky;
+        top: 74px;
+        max-height: calc(100vh - 84px);
+      }
+      .sidebar-head {
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(80, 120, 220, 0.10);
+        background: linear-gradient(180deg, rgba(91,156,255,0.04), rgba(0,0,0,0.0));
+      }
+      .sidebar-title { font-size: 13px; font-weight: 700; }
+      .sidebar-meta { margin-top: 3px; color: var(--muted); font-size: 11px; }
+      .log-nav { padding: 8px; overflow: auto; display: grid; gap: 6px; align-content: start; }
+      .log-item {
+        display: block;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(255,255,255,0.025);
+        border: 1px solid var(--border);
+        border-left: 2px solid rgba(91,156,255,0.22);
+        cursor: pointer;
+        transition: 140ms ease;
+        text-align: left;
+        width: 100%;
+        color: var(--text);
+        font: inherit;
+      }
+      .log-item:hover {
+        background: rgba(91,156,255,0.08);
+        border-color: rgba(91,156,255,0.22);
+        transform: translateY(-1px);
+      }
+      .log-item.active {
+        background: rgba(91,156,255,0.15);
+        border-color: rgba(91,156,255,0.32);
+        border-left-color: rgba(91,156,255,0.70);
+      }
+      .log-name {
+        font-size: 12px;
+        font-weight: 600;
+        word-break: break-all;
+      }
+      .log-meta { margin-top: 4px; display: flex; gap: 8px; color: var(--muted); font-size: 10px; }
+
+      .viewer {
+        background: var(--panel-strong);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      .viewer-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border);
+        flex-wrap: wrap;
+      }
+      .viewer-title {
+        font-size: 13px;
+        font-weight: 700;
+        font-family: ui-monospace, Consolas, monospace;
+        word-break: break-all;
+        min-width: 0;
+        flex: 1;
+      }
+      .viewer-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .viewer-tools select, .viewer-tools input {
+        background: rgba(8, 12, 26, 0.80);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        color: var(--text);
+        font-size: 12px;
+        padding: 6px 9px;
+        outline: none;
+      }
+      .viewer-tools input { width: 160px; }
+      .btn.sm { padding: 6px 10px; font-size: 12px; }
+      .btn.follow-on {
+        background: var(--green-soft);
+        border-color: var(--green-border);
+        color: var(--green);
+      }
+      .btn.danger.armed { color: var(--danger); border-color: rgba(248,113,113,0.4); }
+
+      .viewer-body {
+        flex: 1;
+        overflow: auto;
+        background: #0d1117;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        min-height: 400px;
+      }
+      .log-line { display: flex; gap: 0; white-space: pre-wrap; word-break: break-all; }
+      .log-no {
+        flex: 0 0 auto;
+        min-width: 52px;
+        padding: 0 8px 0 12px;
+        text-align: right;
+        color: rgba(120, 156, 220, 0.38);
+        user-select: none;
+        border-right: 1px solid rgba(80, 120, 220, 0.10);
+      }
+      .log-text { flex: 1; padding: 0 12px; color: #c9d6e8; }
+      .log-line.lv-ERROR   .log-text { color: #ff7b72; }
+      .log-line.lv-WARN    .log-text { color: #e5c07b; }
+      .log-line.lv-INFO    .log-text { color: #7ee8a2; }
+      .log-line.lv-DEBUG   .log-text { color: #8ea1b5; }
+      .log-line.lv-CRITICAL .log-text { color: #ff6b9d; font-weight: 600; }
+      .log-line.hl { background: rgba(251, 146, 60, 0.10); }
+      .log-line.dim { display: none; }
+      .viewer-empty {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .truncated-tip {
+        padding: 6px 14px;
+        background: var(--orange-soft);
+        border-bottom: 1px solid var(--orange-border);
+        color: var(--orange);
+        font-size: 11px;
+      }
+      .stat-chip {
+        padding: 5px 12px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .stat-chip strong { color: var(--text); font-weight: 700; }
+      .stat-chip.live { background: var(--green-soft); border-color: var(--green-border); color: var(--green); }
+
+      @media (max-width: 920px) {
+        .workspace { grid-template-columns: 92px minmax(0, 1fr); }
+        .sidebar-title, .sidebar-meta, .log-meta { display: none; }
+        .log-name { font-size: 10px; }
+      }
+      @media (max-width: 860px) {
+        .workspace { grid-template-columns: 1fr; min-height: auto; }
+        .sidebar { position: static; max-height: 240px; }
+        .sidebar-title, .sidebar-meta, .log-meta { display: flex; }
+        .topbar { flex-direction: column; align-items: stretch; }
+      }
+{% endblock %}
+{% block body %}
+    <div class="wrap">
+      <div class="topbar">
+        <div class="brand">
+          <div class="brand-mark">N</div>
+          <div>
+            <div class="title">L Notepad</div>
+            <div class="subtitle">服务器日志查看器（管理员）</div>
+          </div>
+        </div>
+        <div class="actions">
+          {% if login_user %}
+          <div class="login-chip">
+            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
+            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
+          </div>
+          {% endif %}
+          <a class="btn" href="{{ web_base }}">← 网页端</a>
+          <a class="btn" href="{{ web_base }}/kb" title="进入知识库">📚 知识库</a>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <aside class="sidebar">
+          <div class="sidebar-head">
+            <div class="sidebar-title">日志文件</div>
+            <div class="sidebar-meta" id="log-count">加载中…</div>
+          </div>
+          <div class="log-nav" id="log-nav"></div>
+        </aside>
+
+        <main class="viewer">
+          <div class="viewer-head">
+            <div class="viewer-title" id="viewer-title">← 选择左侧日志文件</div>
+            <div class="viewer-tools">
+              <span class="stat-chip" id="stat-lines">—</span>
+              <span class="stat-chip" id="stat-size" style="display:none;">—</span>
+              <input id="filter-input" type="text" placeholder="过滤关键字…" />
+              <select id="max-lines">
+                <option value="1000">最近 1000 行</option>
+                <option value="3000" selected>最近 3000 行</option>
+                <option value="10000">最近 10000 行</option>
+              </select>
+              <button class="btn sm" id="btn-refresh" type="button">刷新</button>
+              <button class="btn sm follow" id="btn-follow" type="button">▶ 跟踪</button>
+              <a class="btn sm" id="btn-download" href="#" style="display:none;" download>下载</a>
+              <button class="btn sm danger" id="btn-delete" type="button" style="display:none;">删除</button>
+            </div>
+          </div>
+          <div class="truncated-tip" id="truncated-tip" style="display:none;"></div>
+          <div class="viewer-body" id="viewer-body">
+            <div class="viewer-empty">选择左侧日志文件开始查看</div>
+          </div>
+        </main>
+      </div>
+    </div>
+    <div id="toast" role="status" aria-live="polite"></div>
+{% endblock %}
+{% block page_script %}
+    <script>
+      (function () {
+        var ROOT = LN.root;
+        var logNav = document.getElementById("log-nav");
+        var logCount = document.getElementById("log-count");
+        var viewerTitle = document.getElementById("viewer-title");
+        var viewerBody = document.getElementById("viewer-body");
+        var truncatedTip = document.getElementById("truncated-tip");
+        var statLines = document.getElementById("stat-lines");
+        var statSize = document.getElementById("stat-size");
+        var filterInput = document.getElementById("filter-input");
+        var maxLinesSel = document.getElementById("max-lines");
+        var btnRefresh = document.getElementById("btn-refresh");
+        var btnFollow = document.getElementById("btn-follow");
+        var btnDownload = document.getElementById("btn-download");
+        var btnDelete = document.getElementById("btn-delete");
+
+        var currentPath = null;
+        var totalLines = 0;
+        var es = null; // EventSource
+        var followOn = false;
+
+        function apiPath(p) {
+          return p.split("/").map(encodeURIComponent).join("/");
+        }
+        function toast(msg, type) { LN.toast(msg, type); }
+
+        // ── 文件列表 ─────────────────────────────────────────
+        function loadList() {
+          fetch(ROOT + "/api/logs")
+            .then(function (r) { return r.json(); })
+            .then(function (items) {
+              logNav.innerHTML = "";
+              logCount.textContent = "共 " + items.length + " 个文件";
+              if (!items.length) {
+                logNav.innerHTML = '<div class="viewer-empty" style="height:auto;">日志目录为空</div>';
+                return;
+              }
+              items.forEach(function (it) {
+                var b = document.createElement("button");
+                b.type = "button";
+                b.className = "log-item" + (it.path === currentPath ? " active" : "");
+                b.setAttribute("data-path", it.path);
+                var name = document.createElement("div");
+                name.className = "log-name";
+                name.textContent = it.path;
+                var meta = document.createElement("div");
+                meta.className = "log-meta";
+                meta.innerHTML =
+                  '<span>' + LN.esc(LN.fmtSize(it.size)) + '</span>' +
+                  '<span>' + LN.esc(LN.fmtTs(it.mtime)) + '</span>';
+                b.appendChild(name);
+                b.appendChild(meta);
+                b.addEventListener("click", function () { selectLog(it.path); });
+                logNav.appendChild(b);
+              });
+            })
+            .catch(function () { logCount.textContent = "列表加载失败"; });
+        }
+
+        // ── 级别解析（py logging / uvicorn / 通用）──────────
+        function lineLevel(text) {
+          var m = text.match(/\b(CRITICAL|FATAL|ERROR|ERR|WARN|WARNING|INFO|DEBUG|TRACE)\b/);
+          if (!m) return "";
+          var v = m[1];
+          if (v === "FATAL") return "CRITICAL";
+          if (v === "ERR") return "ERROR";
+          if (v === "WARNING" || v === "WARN") return "WARN";
+          return v;
+        }
+
+        function makeLine(no, text, keyword) {
+          var div = document.createElement("div");
+          div.className = "log-line lv-" + lineLevel(text);
+          if (keyword && text.toLowerCase().indexOf(keyword.toLowerCase()) === -1) {
+            div.classList.add("dim");
+          } else if (keyword) {
+            div.classList.add("hl");
+          }
+          var noEl = document.createElement("span");
+          noEl.className = "log-no";
+          noEl.textContent = no;
+          var txt = document.createElement("span");
+          txt.className = "log-text";
+          txt.textContent = text;
+          div.appendChild(noEl);
+          div.appendChild(txt);
+          return div;
+        }
+
+        // ── 渲染（只保留最近 N 行，大文件不至于卡死）────────
+        function renderContent(content, totalSize, truncated) {
+          viewerBody.innerHTML = "";
+          var maxLines = parseInt(maxLinesSel.value, 10) || 3000;
+          var lines = content.split("\n");
+          if (lines.length && lines[lines.length - 1] === "") lines.pop();
+          totalLines = lines.length;
+          var start = Math.max(0, lines.length - maxLines);
+          if (start > 0 || truncated) {
+            truncatedTip.style.display = "";
+            truncatedTip.textContent =
+              (start > 0 ? "已截断：仅渲染最近 " + (totalLines - start) + " / " + totalLines + " 行；" : "") +
+              (truncated ? "文件较大，仅读取了尾部内容（可用「下载」查看全文）。" : "");
+          } else {
+            truncatedTip.style.display = "none";
+          }
+          var kw = filterInput.value.trim();
+          var frag = document.createDocumentFragment();
+          for (var i = start; i < lines.length; i++) {
+            frag.appendChild(makeLine(i + 1, lines[i], kw));
+          }
+          viewerBody.appendChild(frag);
+          statLines.innerHTML = "行 <strong>" + totalLines.toLocaleString() + "</strong>";
+          if (totalSize != null) {
+            statSize.style.display = "";
+            statSize.innerHTML = LN.fmtSize(totalSize);
+          }
+          viewerBody.scrollTop = viewerBody.scrollHeight;
+        }
+
+        // ── 选择 / 加载日志 ────────────────────────────────
+        function selectLog(path) {
+          currentPath = path;
+          stopFollow();
+          Array.prototype.forEach.call(logNav.querySelectorAll(".log-item"), function (el) {
+            el.classList.toggle("active", el.getAttribute("data-path") === path);
+          });
+          viewerTitle.textContent = path;
+          btnDownload.style.display = "";
+          btnDownload.href = ROOT + "/api/logs/" + apiPath(path) + "/download";
+          btnDelete.style.display = "";
+          btnDelete.classList.remove("armed");
+          btnDelete.textContent = "删除";
+          loadContent();
+        }
+
+        function loadContent() {
+          if (!currentPath) return;
+          var maxLines = parseInt(maxLinesSel.value, 10) || 3000;
+          var tail = Math.min(maxLines * 4096, 2 * 1024 * 1024); // 粗略按行宽估尾部字节
+          fetch(ROOT + "/api/logs/" + apiPath(currentPath) + "?tail=" + tail)
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.json();
+            })
+            .then(function (d) {
+              renderContent(d.content, d.total_size, d.truncated);
+            })
+            .catch(function () { toast("日志加载失败", "error"); });
+        }
+
+        // ── follow（SSE 增量追加，Dozzle 式）────────────────
+        function appendChunk(text) {
+          var lines = text.split("\n");
+          // 与已有内容拼接处理：最后一段不完整行也直接渲染（日志流场景可接受）
+          for (var i = 0; i < lines.length; i++) {
+            if (i === lines.length - 1 && lines[i] === "") continue;
+            var last = viewerBody.lastElementChild && viewerBody.lastElementChild.classList.contains("log-line")
+              ? viewerBody.lastElementChild : null;
+            totalLines++;
+            viewerBody.appendChild(makeLine(totalLines, lines[i], filterInput.value.trim()));
+          }
+          // 控制总行数（防长开内存膨胀）
+          while (viewerBody.children.length > 5000) {
+            viewerBody.removeChild(viewerBody.firstChild);
+          }
+          viewerBody.scrollTop = viewerBody.scrollHeight;
+          statLines.innerHTML = "行 <strong>" + totalLines.toLocaleString() + "</strong>";
+        }
+
+        function startFollow() {
+          if (!currentPath) return;
+          es = new EventSource(ROOT + "/api/logs/" + apiPath(currentPath) + "/follow");
+          es.onopen = function () {
+            btnFollow.classList.add("follow-on");
+            btnFollow.textContent = "■ 跟踪中";
+            toast("已开始跟踪日志追加", "success");
+          };
+          es.onmessage = function (ev) {
+            try {
+              var d = JSON.parse(ev.data);
+              if (d.connected || !d.data) return;
+              appendChunk(d.data);
+            } catch (e) { /* 忽略无法解析的帧 */ }
+          };
+          es.onerror = function () {
+            stopFollow();
+          };
+          followOn = true;
+        }
+
+        function stopFollow() {
+          if (es) { es.close(); es = null; }
+          followOn = false;
+          btnFollow.classList.remove("follow-on");
+          btnFollow.textContent = "▶ 跟踪";
+        }
+
+        // ── 事件绑定 ────────────────────────────────────────
+        btnRefresh.addEventListener("click", function () { loadContent(); loadList(); });
+        btnFollow.addEventListener("click", function () { followOn ? stopFollow() : startFollow(); });
+        maxLinesSel.addEventListener("change", function () { loadContent(); });
+        var filterTimer = null;
+        filterInput.addEventListener("input", function () {
+          if (filterTimer) clearTimeout(filterTimer);
+          var v = this.value;
+          filterTimer = setTimeout(function () {
+            var kw = v.trim().toLowerCase();
+            Array.prototype.forEach.call(viewerBody.querySelectorAll(".log-line"), function (el) {
+              var text = el.querySelector(".log-text").textContent;
+              var hit = !kw || text.toLowerCase().indexOf(kw) !== -1;
+              el.classList.toggle("dim", !hit);
+              el.classList.toggle("hl", hit && !!kw);
+            });
+          }, 120);
+        });
+        btnDelete.addEventListener("click", function () {
+          if (!currentPath) return;
+          if (!btnDelete.classList.contains("armed")) {
+            btnDelete.classList.add("armed");
+            btnDelete.textContent = "确认删除？";
+            return;
+          }
+          fetch(ROOT + "/api/logs/" + apiPath(currentPath), { method: "DELETE" })
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.json();
+            })
+            .then(function () {
+              toast("已删除 " + currentPath);
+              currentPath = null;
+              viewerTitle.textContent = "← 选择左侧日志文件";
+              viewerBody.innerHTML = '<div class="viewer-empty">选择左侧日志文件开始查看</div>';
+              statLines.textContent = "—";
+              statSize.style.display = "none";
+              btnDownload.style.display = "none";
+              btnDelete.style.display = "none";
+              truncatedTip.style.display = "none";
+              loadList();
+            })
+            .catch(function () { toast("删除失败", "error"); });
+        });
+
+        loadList();
+      })();
+    </script>
+{% endblock %}

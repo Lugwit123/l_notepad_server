@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}笔记管理 - L Notepad{% endblock %}
+{% block page_style %}
+      .topbar { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--border); }
+      .brand { display:flex; align-items:center; gap:10px; font-weight:700; }
+      .brand-mark { width:30px; height:30px; border-radius:8px; background:linear-gradient(135deg,var(--accent),var(--cyan)); color:#06122b; font-weight:800; display:flex; align-items:center; justify-content:center; }
+      .brand-sub { color: var(--muted); font-size:12px; font-weight:400; }
+      .actions { display:flex; align-items:center; gap:10px; }
+      .login-name { font-size:12px; color: var(--muted); }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
+      .stats { margin: 12px 0; font-size: 12px; color: var(--muted); }
+      .panel { background: var(--card-bg); border:1px solid var(--border); border-radius:14px; overflow:hidden; }
+      table { width:100%; border-collapse: collapse; font-size:13px; }
+      th, td { text-align:left; padding:10px 14px; border-bottom:1px solid var(--border); vertical-align:middle; }
+      th { color: var(--muted); font-weight:600; font-size:12px; background: rgba(8,11,20,0.5); }
+      tr:hover td { background: rgba(91,156,255,0.05); }
+      .path { font-family: ui-monospace, Consolas, monospace; font-size:12px; }
+      .badge.pub { color: var(--green); border-color: rgba(74,222,128,0.3); background: rgba(74,222,128,0.08); }
+      .badge.priv { color: var(--muted); }
+      .shares { font-size:11px; color: var(--muted); }
+      .op-btn { font-size:11px; padding:3px 10px; margin-right:6px; border-radius:6px; border:1px solid var(--border); background:transparent; color:var(--text); cursor:pointer; }
+      .op-btn:hover { border-color: var(--accent-border); }
+      .op-btn.danger:hover { color: var(--danger); border-color: rgba(248,113,113,0.4); }
+      .op-btn.primary { color: var(--accent); border-color: var(--accent-border); }
+      .op-btn.armed { color: var(--danger); border-color: rgba(248,113,113,0.4); }
+      .op-input { background: rgba(8,11,20,0.7); border:1px solid var(--border); color:var(--text); font-size:12px; padding:4px 8px; border-radius:6px; width:130px; margin-right:6px; }
+      .op-input:focus { border-color: var(--accent-border); }
+      .op-select { width: 130px; height: 28px; }
+      /* 操作列强制单行，避免编辑控件换行 */
+      #tbody td:last-child { white-space: nowrap; }
+      .empty { padding:40px; text-align:center; color:var(--muted); }
+      .toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%); padding:9px 18px; border-radius:10px; font-size:13px; background:var(--panel); border:1px solid var(--border); opacity:0; transition:opacity .2s; pointer-events:none; }
+      .toast.show { opacity:1; }
+      .toast.err { color: var(--danger); border-color: rgba(248,113,113,0.4); }
+      .toast.ok { color: var(--green); border-color: rgba(74,222,128,0.3); }
+{% endblock %}
+{% block body %}
+    <div class="topbar">
+      <div class="brand">
+        <div class="brand-mark">N</div>
+        <div>
+          <div>L Notepad <span class="brand-sub">· 笔记管理（管理员）</span></div>
+        </div>
+      </div>
+      <div class="actions">
+        {% if login_user %}<span class="login-name">👤 {{ login_user }} · {{ login_role }}</span>{% endif %}
+        <a class="btn" href="{{ web_base }}/logs">服务日志</a>
+        <a class="btn" href="{{ web_base }}">返回网页端</a>
+        <button class="btn" onclick="doLogout()">登出</button>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <div class="stats" id="stats">加载中…</div>
+      <div class="panel">
+        <table>
+          <thead>
+            <tr>
+              <th>笔记路径</th><th>拥有者</th><th>可见性</th><th>共享给</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div class="empty" id="empty" style="display:none;">暂无任何笔记</div>
+      </div>
+    </div>
+    <div class="toast" id="toast"></div>
+{% endblock %}
+{% block page_script %}
+    <script>
+      (function () {
+        function api(path) { return (LN.root ? LN.root : "") + path; }
+        var tbody = document.getElementById("tbody");
+        var stats = document.getElementById("stats");
+        var empty = document.getElementById("empty");
+        var toastEl = document.getElementById("toast");
+        var timer = null;
+        function toast(msg, type) {
+          toastEl.textContent = msg;
+          toastEl.className = "toast show " + (type || "ok");
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(function () { toastEl.className = "toast"; }, 2200);
+        }
+        function enc(p) { return encodeURIComponent(p); }
+        function esc(s) { return LN.esc(s); }
+        function permLabel(perm) { return perm === "write" ? "可编辑" : "只读"; }
+
+        function render(notes) {
+          tbody.innerHTML = "";
+          empty.style.display = notes.length ? "none" : "block";
+          stats.textContent = "共 " + notes.length + " 篇笔记";
+          notes.forEach(function (n) {
+            var sharesHtml = n.public
+              ? '<span class="badge pub">🌐 公共</span>'
+              : (n.shares || []).map(function (s) {
+                  return '<span class="badge">👤 ' + esc(s.shared_with) + '（' + permLabel(s.permission) + '）</span>';
+                }).join(" ") || '<span class="badge priv">私有</span>';
+            var tr = document.createElement("tr");
+            tr.innerHTML =
+              '<td class="path">' + esc(n.path) + '</td>' +
+              '<td>' + esc(n.owner) + '</td>' +
+              '<td><span class="badge ' + (n.public ? "pub" : "priv") + '">' + (n.public ? "全部共享" : ((n.shares && n.shares.length) ? "定向共享" : "私有")) + '</span></td>' +
+              '<td class="shares">' + sharesHtml + '</td>' +
+              '<td>' +
+                '<button class="op-btn primary" onclick="togglePublic(this,\'' + enc(n.path).replace(/'/g, "\\'") + '\',' + n.public + ')">' + (n.public ? "取消公共" : "设为公共") + '</button>' +
+                '<button class="op-btn" onclick="changeOwner(this,\'' + enc(n.path).replace(/'/g, "\\'") + '\')">改拥有者</button>' +
+                '<button class="op-btn danger" onclick="delNote(this,\'' + enc(n.path).replace(/'/g, "\\'") + '\')">删除</button>' +
+                '</td>';
+            tbody.appendChild(tr);
+          });
+        }
+
+        function refresh() {
+          fetch(api("/api/admin/notes"))
+            .then(function (r) { return r.json(); })
+            .then(function (d) { render(d.notes || []); })
+            .catch(function () { toast("加载失败", "err"); });
+        }
+        window.refresh = refresh;
+
+        window.togglePublic = function (btn, pathEnc, current) {
+          fetch(api("/api/admin/notes/" + pathEnc + "/public"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ public: !current })
+          }).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          }).then(function (d) {
+            toast(d.public ? "已设为全部共享" : "已取消公共");
+            refresh();
+          }).catch(function () { toast("操作失败", "err"); });
+        };
+        window.changeOwner = function (btn, pathEnc) {
+          var cell = btn.parentNode;
+          var opts = userList.map(function (u) {
+            var label = u.username + (u.display_name ? '（' + u.display_name + '）' : '');
+            return '<option value="' + esc(u.username) + '">' + esc(label) + '</option>';
+          }).join("");
+          cell.innerHTML =
+            '<select id="owner-input" class="op-input op-select">' + opts + '</select>' +
+            '<button class="op-btn primary" onclick="confirmOwner(\'' + pathEnc + '\')">确认</button>' +
+            '<button class="op-btn" onclick="refresh()">取消</button>';
+          var inp = document.getElementById("owner-input");
+          if (inp) inp.focus();
+        };
+        window.confirmOwner = function (pathEnc) {
+          var sel = document.getElementById("owner-input");
+          var newOwner = sel ? sel.value : "";
+          if (!newOwner) { toast("请选择用户", "err"); return; }
+          fetch(api("/api/admin/notes/" + pathEnc + "/owner"), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ owner: newOwner })
+          }).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          }).then(function () { toast("拥有者已改为 " + newOwner); refresh(); })
+            .catch(function () { toast("操作失败", "err"); });
+        };
+        window.delNote = function (btn, pathEnc) {
+          if (btn.getAttribute("data-armed") !== "1") {
+            btn.setAttribute("data-armed", "1");
+            btn.textContent = "确认删除？";
+            btn.classList.add("armed");
+            return;
+          }
+          fetch(api("/api/admin/notes/" + pathEnc), { method: "DELETE" })
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.json();
+            }).then(function () { toast("已删除"); refresh(); })
+            .catch(function () { toast("删除失败", "err"); });
+        };
+        // 预加载用户列表（改拥有者下拉用）
+        var userList = [];
+        fetch(api("/api/admin/users")).then(function (r) { return r.json(); })
+          .then(function (d) { userList = d.users || []; })
+          .catch(function () { userList = []; });
+        refresh();
+      })();
+    </script>
+{% endblock %}
