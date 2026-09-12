@@ -332,10 +332,10 @@ def _is_prod() -> bool:
 
 
 def note_browser_link(rel: str, request: Any | None = None) -> dict[str, str]:
-    """返回某笔记在 lugwit_baidu_netdisk 网页端的文件浏览地址。
+    """返回某笔记在 lugwit_baidu_netdisk 网页端的文件预览地址。
 
-    该 Web 服务只支持按目录深链（?dir=/apps/...），不支持定位到单个文件，
-    故返回笔记所在父目录的浏览页地址。
+    网盘 /files 页支持 ?dir=<目录>&open=<完整路径> 深链：加载目录后自动弹出
+    该文件的预览视图（文本/图片/音视频等）。返回笔记的直开预览地址。
 
     files_base 生成顺序（由系统级环境变量 Lugwit_deploy 区分开发机/公网部署机）：
       公网（Lugwit_deploy=1）：强制按请求 Host 动态拼接 scheme://host + files_prefix，忽略 files_base
@@ -366,7 +366,12 @@ def note_browser_link(rel: str, request: Any | None = None) -> dict[str, str]:
     else:
         # 开发机：显式 files_base 优先；未配置时回退动态
         files_base = str(_cfg_get("files_base") or "").strip().rstrip("/") or dynamic
-    url = f"{files_base}/files?dir={quote(folder, safe='')}" if files_base and folder else ""
+    url = ""
+    if files_base and folder:
+        url = (
+            f"{files_base}/files?dir={quote(folder, safe='')}"
+            f"&open={quote(remote_path, safe='')}"
+        )
     return {"url": url, "remote_path": remote_path, "folder": folder}
 
 

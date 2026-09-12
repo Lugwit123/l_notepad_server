@@ -1945,7 +1945,7 @@
           .then(function (d) {
             if (!d || !d.ok || !d.url) { wrap.style.display = "none"; return; }
             wrap.style.display = "";
-            wrap.innerHTML = '☁️ <a href="' + d.url + '" target="_blank" rel="noopener">百度云地址</a>'
+            wrap.innerHTML = '☁️ <a href="' + d.url + '" target="_blank" rel="noopener">在百度云查看本文</a>'
               + (d.remote_path ? ' <span class="hint">' + d.remote_path + '</span>' : "");
           })
           .catch(function () { wrap.style.display = "none"; });
