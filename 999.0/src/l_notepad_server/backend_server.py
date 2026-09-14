@@ -37,6 +37,8 @@ from .routers import accounts, admin, kb, logs, notes, web
 
 from pytracemp import lprint
 
+from l_app_ready.hotreload_service import PORT_ENV, SrcWatchService
+
 
 def _parse_db_path(value: str | None) -> Path:
     if value:
@@ -65,6 +67,9 @@ PUBLIC_PATHS = (
     "/redoc",
     "/openapi.json",
     "/api/health",
+    # 热重载开关（本机运维接口，与 /api/health 同级）：登录态会把主页/脚本的探活请求
+    # 302 到登录页，导致"开关看不见状态"。只读状态 + 受 .dev_mod 硬门控，暴露无风险。
+    "/__dev__/src_watch",
 )
 
 
@@ -72,6 +77,33 @@ def create_dev_app() -> FastAPI:
     """uvicorn --reload 工厂入口：create_app 需要 db_path 参数，
     reloader 子进程只能无参重建，这里用默认/环境变量路径。"""
     return create_app(_parse_db_path(None))
+
+
+# ── 源码热重载（统一 L_SRC_WATCH，替代 uvicorn --reload）──────────────────────
+# 单进程运行；改 .py 自重启，改 templates/*.html 靠 Jinja auto_reload 刷新即变。
+# **硬门控：必须带 .dev_mod 才开**（详见 Rez-Docs/src_hot_reload_源码热重载与主页常驻.md）。
+# 注：数据/日志都落在用户目录（`~/.Lugwit/l_notepad`、`D:\Temp\Log`），不写包源码目录；
+# `__pycache__` 由 DefaultExcludeDirs 排除，不会出现"写文件→重启→再写"死循环。
+_PORT = int(os.environ.get(PORT_ENV) or 8765)
+
+
+def _runtime_dir() -> Path:
+    override = os.environ.get("L_NOTEPAD_RUNTIME")
+    p = Path(override) if override else Path.home() / ".lugwit" / "l_notepad_server" / "runtime"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+_sw = SrcWatchService(
+    module="l_notepad_server.backend_server",
+    pkg="l_notepad_server",
+    alias="l_notepad_api",
+    port=_PORT,
+    watch_root=Path(__file__).resolve().parent,
+    runtime_dir=_runtime_dir(),
+    label="l_notepad",
+)
+_sw.start()
 
 
 def create_app(db_path: Path) -> FastAPI:
@@ -85,12 +117,11 @@ def create_app(db_path: Path) -> FastAPI:
     templates_dir = Path(__file__).resolve().parent / "templates"
     static_dir = Path(__file__).resolve().parent / "static"
     templates = Jinja2Templates(directory=str(templates_dir))
-    # .dev_mod 热更新：模板不缓存，改 .html 后刷新页面即生效（无需进程重启）。
-    # 注：uvicorn 的 --reload 在未装 watchfiles 时退化为 StatReload，只监听 *.py，
-    # reload_includes 对模板不生效——所以模板改动靠这里 auto_reload 兜底。
-    if os.environ.get("L_DEV_MOD") == "1":
-        templates.env.auto_reload = True
+    # 热重载开启时模板不缓存，改 .html 后刷新页面即生效（无需进程重启）
+    templates.env.auto_reload = _sw.is_enabled()
     app.state.templates = templates
+    _sw.jinja_env = templates.env   # 之后在页面上切开关时 auto_reload 会跟着变
+    _sw.mount(app)                  # GET/POST /__dev__/src_watch
 
     notes_root = paths.notes_dir()
     file_store.ensure_root(notes_root)
@@ -229,48 +260,23 @@ def create_app(db_path: Path) -> FastAPI:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    # 独立重启执行进程：只做「停旧 + 起新」，不做服务初始化
+    if _sw.handle_restart_argv(argv):
+        return 0
     parser = argparse.ArgumentParser(description="L Notepad backend server")
     # 默认仅监听回环：对外暴露需显式指定 --host 或 L_NOTEPAD_HOST（生产走 nginx 反代 /note）
     parser.add_argument("--host", default=os.environ.get("L_NOTEPAD_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("L_NOTEPAD_PORT", "8765")))
+    parser.add_argument("--port", type=int, default=_PORT)
     parser.add_argument("--db", default=None, help="sqlite db path (default: package data/notepad.sqlite3)")
     parser.add_argument("--log-level", default=os.environ.get("L_NOTEPAD_LOG_LEVEL", "info"))
-    parser.add_argument(
-        "--reload",
-        action="store_true",
-        # 优先级：L_NOTEPAD_RELOAD > L_DEV_MOD（wuwo 特殊包名 .dev_mod 注入）
-        default=os.environ.get("L_NOTEPAD_RELOAD", "").strip() in {"1", "true", "True", "yes", "YES"}
-        or os.environ.get("L_DEV_MOD") == "1",
-        help="Enable auto-reload (dev only; auto-on with wuwo .dev_mod)",
-    )
     args = parser.parse_args(argv)
+    _sw.port = args.port   # 端口以实际启动参数为准（重启时按它找旧进程）
 
-    if args.reload:
-        # reload 需要传 import string + factory（app 对象无法在 reloader 子进程重建）；
-        # 只监视本包源码目录，排除日志/临时/测试文件避免重启风暴。
-        # reload_includes 覆盖 uvicorn 默认的仅 *.py：装了 watchfiles 时，
-        # .dev_mod 热更新即可兼容模板/静态/CSS/JS 等所有前端文件改动。
-        # （未装 watchfiles 时 uvicorn 退化为 StatReload，此配置不生效，
-        #   模板改动由 create_app 里的 Jinja auto_reload 兜底，见上。）
-        uvicorn.run(
-            "l_notepad_server.backend_server:create_dev_app",
-            factory=True,
-            host=args.host,
-            port=args.port,
-            log_level=args.log_level,
-            reload=True,
-            reload_dirs=[str(Path(__file__).resolve().parent)],
-            reload_includes=[
-                "*.py", "*.html", "*.css", "*.js", "*.json", "*.svg", "*.mmd",
-            ],
-            reload_excludes=[
-                "*.log", "logs/*", "*test*", ".*", ".py[cod]", ".sw.*", "~*",
-                "__pycache__/*",
-            ],
-        )
-    else:
-        app = create_app(_parse_db_path(args.db))
-        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, reload=False)
+    # 热重载改由进程内 SrcHotReload 负责（统一开关 L_SRC_WATCH）：不再使用 uvicorn --reload
+    # （它生成的 reload 孤儿 worker 命令行不含 app 名，.solo 守卫看不见 → 双实例抢端口）。
+    app = create_app(_parse_db_path(args.db))
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
 

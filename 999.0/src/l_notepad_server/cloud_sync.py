@@ -58,6 +58,12 @@ _DEFAULTS: dict[str, Any] = {
         "sync_service_url": "http://127.0.0.1:1028",
         "files_base": "",
         "files_prefix": "/baidu",
+        # 新百度云服务（depot 版本库）：笔记作为 dir 模式的库 /notes，
+        # 物理落在 version_depot/dir_mirror/notes，推送走 /api/depot/submit_stream
+        # （每次保存 = 一个版本，可在 depot 页面看历史/差异）。
+        "use_depot": True,
+        "depot_library": "/notes",
+        "depot_workspace": "notes-sync",
     },
 }
 
@@ -105,12 +111,15 @@ def _apply_env(cfg: dict) -> None:
         "sync_service_url": "L_CLOUD_SYNC_SERVICE_URL",
         "files_base": "L_CLOUD_SYNC_FILES_BASE",
         "files_prefix": "L_CLOUD_SYNC_FILES_PREFIX",
+        "use_depot": "L_CLOUD_SYNC_USE_DEPOT",
+        "depot_library": "L_CLOUD_SYNC_DEPOT_LIB",
+        "depot_workspace": "L_CLOUD_SYNC_DEPOT_WS",
     }
     for key, env in raw_env.items():
         val = os.environ.get(env, "")
         if not val:
             continue
-        if key == "enabled":
+        if key in ("enabled", "use_depot"):
             cs[key] = val.strip().lower() in ("1", "true", "yes", "on")
         elif key == "poll_interval_seconds":
             try:
@@ -214,15 +223,65 @@ def enabled() -> bool:
 
 # ── 路径映射 ─────────────────────────────────────────
 
+def _use_depot() -> bool:
+    return bool(_cfg_get("use_depot"))
+
+
+def _depot_library() -> str:
+    """笔记库 root（dir 模式），默认 /notes。"""
+    lib = str(_cfg_get("depot_library") or "").strip()
+    if not lib:
+        sub = str(_cfg_get("remote_subpath") or "notes").strip("/") or "notes"
+        lib = "/" + sub
+    return "/" + lib.strip("/")
+
+
+def _depot_path(rel: str) -> str:
+    return f"{_depot_library()}/{rel.replace('\\', '/').strip('/')}"
+
+
 def _remote_base() -> str:
-    """远端基路径：apps 根 + remote_subpath。app_folder 配置时用 /apps/<folder>。"""
+    """远端基路径。
+
+    新服务（use_depot，默认）：depot 库的 dir 镜像 =
+        {apps}/version_depot/dir_mirror/<库>     ← 活文件就是最新版
+    旧约定：{apps}[/<app_folder>]/<remote_subpath>（裸目录）
+    app_folder 配置时用 /apps/<folder>。
+    """
     folder = str(_cfg_get("app_folder") or "").strip()
     if folder:
         apps = "/apps/" + folder.strip("/")
     else:
         apps = _remote_apps_root()
     sub = str(_cfg_get("remote_subpath") or "").strip("/")
+    if _use_depot():
+        lib = _depot_library().strip("/")
+        return f"{apps}/version_depot/dir_mirror/{lib}"
     return (apps + "/" + sub).replace("//", "/") if sub else apps
+
+
+_ws_id: Optional[int] = None
+
+
+def _depot_ws() -> int:
+    """笔记库的工作区 id（提交必须带 ws）：没有就建一个，缓存住。"""
+    global _ws_id
+    if _ws_id:
+        return _ws_id
+    lib = _depot_library()
+    want = str(_cfg_get("depot_workspace") or "notes-sync").strip() or "notes-sync"
+    data = _http("GET", "/api/depot/workspace")
+    for w in (data or {}).get("workspaces") or []:
+        if str(w.get("library")) == lib and str(w.get("name")) == want:
+            _ws_id = int(w.get("id") or 0)
+            return _ws_id
+    res = _http("POST", "/api/depot/workspace",
+                {"name": want, "library": lib, "local_root": "", "host": ""})
+    _ws_id = int(((res or {}).get("workspace") or {}).get("id") or 0)
+    if not _ws_id:
+        raise RuntimeError(f"创建笔记工作区失败: {res}")
+    lprint(f"[cloud_sync] 已创建工作区 {want} (ws={_ws_id}) 库={lib}")
+    return _ws_id
 
 
 def _local_path(rel: str) -> Path:
@@ -249,8 +308,41 @@ def _remote_path(rel: str) -> str:
 
 # ── 推送（本地 → 云端） ─────────────────────────────────────────
 
+def _http_raw(path: str, data: bytes, timeout: int = 300) -> Any:
+    """POST 原始字节（/api/depot/submit_stream 这类流式上传接口用）。"""
+    req = urllib.request.Request(
+        _base_url() + path, data=data, method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"[cloud_sync] HTTP POST {path} -> {exc.code}: {detail}") from exc
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
 def _push_upsert(rel: str) -> None:
     local = _local_path(rel)
+    if _use_depot():
+        # 一步提交：服务端写 blob + dir 镜像活文件 + 一个版本；每次保存 = 一版
+        dpath = _depot_path(rel)
+        qs = urllib.parse.urlencode({
+            "path": dpath,
+            "description": f"笔记 {rel}",
+            "ws": _depot_ws(),
+        })
+        _http_raw(
+            f"/api/depot/submit_stream?{qs}",
+            local.read_bytes(),
+        )
+        return
     remote = _remote_path(rel)
     remote_dir = str(Path(remote).parent).replace("\\", "/")
     remote_name = str(Path(remote).name)
@@ -268,6 +360,10 @@ def _push_upsert(rel: str) -> None:
 
 
 def _push_delete(rel: str) -> None:
+    if _use_depot():
+        _http("POST", f"/api/depot/delete?ws={_depot_ws()}",
+              {"paths": [_depot_path(rel)], "description": f"删除笔记 {rel}"})
+        return
     _http("POST", "/api/files/delete", {"paths": [_remote_path(rel)]})
 
 
@@ -368,10 +464,14 @@ def note_browser_link(rel: str, request: Any | None = None) -> dict[str, str]:
         files_base = str(_cfg_get("files_base") or "").strip().rstrip("/") or dynamic
     url = ""
     if files_base and folder:
-        url = (
-            f"{files_base}/files?dir={quote(folder, safe='')}"
-            f"&open={quote(remote_path, safe='')}"
-        )
+        if _use_depot():
+            # 新服务：直接开 depot 页面的该文件（页面支持 ?path= 深链，落到「预览」标签）
+            url = f"{files_base}/depot?path={quote(_depot_path(rel), safe='')}"
+        else:
+            url = (
+                f"{files_base}/files?dir={quote(folder, safe='')}"
+                f"&open={quote(remote_path, safe='')}"
+            )
     return {"url": url, "remote_path": remote_path, "folder": folder}
 
 
@@ -412,6 +512,9 @@ def _pull_once() -> int:
         fp = str(it.get("path") or "")
         rel = _rel_from_base(remote_base, fp)
         if not rel:
+            continue
+        # depot dir 镜像里 <父目录>/.versions/<名>/vNNN/ 是历史快照，不是笔记
+        if ".versions/" in rel or rel.startswith(".versions/"):
             continue
         fsid = it.get("fs_id")
         if not fsid:
