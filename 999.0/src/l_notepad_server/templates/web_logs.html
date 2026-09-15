@@ -200,28 +200,9 @@
         .topbar { flex-direction: column; align-items: stretch; }
       }
 {% endblock %}
+{% block appbar_sub %}服务器日志查看器（管理员）{% endblock %}
 {% block body %}
     <div class="wrap">
-      <div class="topbar">
-        <div class="brand">
-          <div class="brand-mark">N</div>
-          <div>
-            <div class="title">L Notepad</div>
-            <div class="subtitle">服务器日志查看器（管理员）</div>
-          </div>
-        </div>
-        <div class="actions">
-          {% if login_user %}
-          <div class="login-chip">
-            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-          </div>
-          {% endif %}
-          <a class="btn" href="{{ web_base }}">← 网页端</a>
-          <a class="btn" href="{{ web_base }}/kb" title="进入知识库">📚 知识库</a>
-        </div>
-      </div>
-
       <div class="workspace">
         <aside class="sidebar">
           <div class="sidebar-head">

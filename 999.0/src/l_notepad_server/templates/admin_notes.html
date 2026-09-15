@@ -34,22 +34,9 @@
       .toast.err { color: var(--danger); border-color: rgba(248,113,113,0.4); }
       .toast.ok { color: var(--green); border-color: rgba(74,222,128,0.3); }
 {% endblock %}
+{% block appbar_sub %}笔记管理（管理员）{% endblock %}
+{% block page_id %}admin-notes{% endblock %}
 {% block body %}
-    <div class="topbar">
-      <div class="brand">
-        <div class="brand-mark">N</div>
-        <div>
-          <div>L Notepad <span class="brand-sub">· 笔记管理（管理员）</span></div>
-        </div>
-      </div>
-      <div class="actions">
-        {% if login_user %}<span class="login-name">👤 {{ login_user }} · {{ login_role }}</span>{% endif %}
-        <a class="btn" href="{{ web_base }}/logs">服务日志</a>
-        <a class="btn" href="{{ web_base }}">返回网页端</a>
-        <button class="btn" onclick="doLogout()">登出</button>
-      </div>
-    </div>
-
     <div class="wrap">
       <div class="stats" id="stats">加载中…</div>
       <div class="panel">

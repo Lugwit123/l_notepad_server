@@ -45,6 +45,8 @@
         --danger:        rgba(255, 88, 88, 0.18);
         --danger-border: rgba(255, 88, 88, 0.42);
       }
+      /* 编辑器主题由全站外观菜单写入 <html data-editor-theme>（也兼容 body 上的旧写法） */
+      html[data-editor-theme="classic"] body,
       body[data-editor-theme="classic"] {
         --editor-bg: rgba(12, 19, 33, 0.84);
         --editor-fg: var(--text);
@@ -73,54 +75,34 @@
         --md-line: rgba(255,255,255,0.10);
       }
       .wrap { width: 100%; max-width: none; margin: 0; padding: 10px 12px 12px; }
-      .topbar {
+      /* 左列顶部：笔记元信息（标题/操作已上移到全站顶栏） */
+      .note-meta {
         display: flex;
-        flex-direction: column;
-        gap: 0;
-        padding: 10px 12px;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 12px;
+        padding: 9px 12px;
         background: var(--panel);
         border: 1px solid var(--border);
-        border-bottom-color: rgba(91,156,255,0.10);
         border-radius: 14px;
-        backdrop-filter: blur(20px) saturate(160%);
-        box-shadow: var(--shadow), 0 1px 0 rgba(91,156,255,0.08) inset;
+        font-size: 11px;
+        color: var(--muted);
         flex-shrink: 0;
       }
+      .note-meta .ts-label { opacity: 0.65; }
+      .note-meta .ts-val { font-variant-numeric: tabular-nums; }
+      /* 顶栏里的标题 badge */
+      .appbar .badge { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .appbar-note-title { font-weight: 600; color: var(--accent-bright); }
       /* 标题行：dirty-dot + 标题 + badge + 操作按钮 */
       .topbar-head {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
         min-width: 0;
       }
-      .topbar-left {
-        display: flex;
-        align-items: center;
-        gap: 7px;
-        min-width: 0;
-        flex: 1;
-      }
-      .topbar-actions {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        flex-shrink: 0;
-      }
-      /* 时间行 */
-      .topbar-meta {
-        margin-top: 7px;
-        padding-top: 7px;
-        border-top: 1px solid var(--border);
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px 12px;
-        font-size: 11px;
-        color: var(--muted);
-        line-height: 1.5;
-      }
-      .topbar-meta .ts-label { opacity: 0.65; }
-      .topbar-meta .ts-val   { font-variant-numeric: tabular-nums; }
       .title { font-weight: 700; letter-spacing: 0.2px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
       .btn {
@@ -137,6 +119,8 @@
         gap: 10px;
         align-items: start;
       }
+      /* 网格项默认 min-width:auto，会被长内容（如脑图 SVG）顶宽整页 */
+      .layout > * { min-width: 0; }
       /* 左列：topbar + 日志列表，整体粘性 */
       .left-col {
         display: flex;
@@ -176,29 +160,48 @@
       .note-nav .nav-item:nth-child(6n+6):hover, .note-nav .nav-item:nth-child(6n+6).active { border-left-color: rgba(244,114,182,0.62); }
       /* side-panel 跟随左列流动，内部可滚 */
       .side-panel {
-        overflow: hidden;
+        overflow-y: auto;
+        overflow-x: hidden;
         display: flex;
         flex-direction: column;
-        flex: 1;
+        flex: 1 1 auto;
         min-height: 0;
         background:
           radial-gradient(300px 120px at 100% 0%, rgba(91,156,255,0.06), transparent 60%),
           var(--panel2);
       }
+      /* 日志列表块：撑满剩余高度，列表自身滚动 */
+      .side-panel > .side-block {
+        flex: 0 0 auto;
+      }
+      .side-panel > .side-block:first-child {
+        display: flex;
+        flex-direction: column;
+        flex: 1 1 auto;
+        /* 保底高度，避免面板过矮时块之间互相压叠（面板自身可滚） */
+        min-height: 190px;
+      }
       .note-nav {
         margin-top: 10px;
         overflow: auto;
         display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        /* 列表高度受限时必须按内容撑开行，否则行会被压扁 */
+        grid-auto-rows: max-content;
         gap: 6px;
+        flex: 1 1 auto;
+        min-height: 0;
       }
       .nav-item {
         display: block;
+        min-width: 0;
         padding: 7px 9px 6px;
         border-radius: 10px;
         background: rgba(255,255,255,0.025);
         border: 1px solid var(--border);
         border-left: 2px solid rgba(91,156,255,0.22);
         transition: 140ms ease;
+        overflow: hidden;
       }
       .nav-item:hover {
         background: rgba(91,156,255,0.08);
@@ -218,6 +221,14 @@
         align-items: center;
         justify-content: space-between;
         gap: 6px;
+        min-width: 0;
+      }
+      /* 路径 badge 过长时换行，不再把时间挤出可视区 */
+      .nav-top .badge {
+        flex: 0 1 auto;
+        min-width: 0;
+        white-space: normal;
+        overflow-wrap: anywhere;
       }
       .nav-time {
         font-size: 10px;
@@ -230,9 +241,9 @@
         margin-top: 5px;
         font-size: 12px;
         font-weight: 600;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        min-width: 0;
+        white-space: normal;
+        overflow-wrap: anywhere;
         color: var(--accent-bright);
       }
       .nav-snippet {
@@ -315,13 +326,10 @@
       .editor-head {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 8px 12px;
         margin-bottom: 10px;
-        flex-wrap: nowrap;
+        flex-wrap: wrap;
         min-width: 0;
-        overflow-x: auto;
-        overflow-y: hidden;
-        scrollbar-width: thin;
       }
       .editor-shell {
         display: flex;
@@ -410,9 +418,13 @@
       }
       .editor-actions {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         gap: 8px;
+        flex: 0 1 auto;
+        min-width: 0;
       }
+      .editor-actions .hint { white-space: nowrap; }
       .toggle-btn.visible { display: inline-flex; }
       .toggle-btn { display: none; }
       .sync-btn.sync-on {
@@ -540,8 +552,9 @@
       /* ── 编辑器状态栏 ── */
       .editor-statusbar {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        gap: 16px;
+        gap: 4px 16px;
         padding: 5px 10px;
         font-size: 11px;
         color: var(--muted);
@@ -554,6 +567,8 @@
         display: flex;
         align-items: center;
         gap: 5px;
+        flex-shrink: 0;
+        white-space: nowrap;
       }
       .editor-statusbar .stat-sep {
         width: 1px;
@@ -587,7 +602,7 @@
         align-items: center;
         gap: 8px;
         min-width: 0;
-        flex: 1 1 auto;
+        flex: 1 1 260px;
       }
       .title-row .inline-label {
         flex: 0 0 auto;
@@ -597,7 +612,7 @@
       }
       .title-row input {
         flex: 1 1 0;
-        min-width: 0;
+        min-width: 90px;
       }
       .file-type-badge {
         display: none;
@@ -634,16 +649,27 @@
 
       @media (max-width: 920px) {
         .layout { grid-template-columns: 92px minmax(0, 1fr); }
-        .sidebar-title, .sidebar-meta { display: none; }
+        .sidebar-title, .sidebar-meta, .side-meta { display: none; }
         .nav-item { padding: 9px 8px; }
         .nav-title, .nav-snippet { display: none; }
-        .note-nav { padding: 6px; }
+        .note-nav { padding: 4px; }
+        .side-panel { padding: 8px; }
+        /* 窄列：时间与路径二选一，路径单行省略 */
+        .note-nav .nav-time { display: none; }
+        .note-nav .nav-top .badge { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        /* 窄列：标题 badge / 用户名让位，按钮收紧，避免 topbar 被撑高 */
+        .topbar { padding: 8px; }
+        .topbar-left .badge { display: none; }
+        .topbar-actions .login-name { display: none; }
+        .topbar-actions .login-chip { margin-right: 0; }
+        .topbar-actions .btn { padding: 5px 8px; font-size: 11px; white-space: normal; text-align: center; }
       }
       @media (max-width: 860px) {
-        .layout { grid-template-columns: 1fr; min-height: auto; }
+        .layout { grid-template-columns: minmax(0, 1fr); min-height: auto; }
         .left-col { position: static; max-height: none; }
         .side-panel { max-height: 320px; }
-        .sidebar-title, .sidebar-meta, .nav-title, .nav-snippet { display: block; }
+        .sidebar-title, .sidebar-meta, .side-meta, .nav-title, .nav-snippet { display: block; }
+        .note-nav .nav-time { display: block; }
         .topbar { flex-direction: column; align-items: stretch; }
         .topbar-actions { justify-content: flex-end; flex-wrap: wrap; }
       }
@@ -848,43 +874,34 @@
         outline: none;
       }
 {% endblock %}
+{% block page_id %}note-edit{% endblock %}
+{% block appbar_sub %}
+        <span id="dirty-dot" class="dirty-dot" title="有未保存的改动"></span>
+        {% if note %}
+        {% if note.title and note.title != note.path %}<span class="appbar-note-title">{{ note.title }}</span>{% endif %}
+        <span class="badge">{{ note.path }}</span>
+        {% else %}新建笔记{% endif %}
+{% endblock %}
+{% block appbar_actions %}
+          <a class="btn" href="{{ web_base }}">← 列表</a>
+          {% if note %}
+          <button class="btn" type="button" id="btn-publish-kb" data-path="{{ note.path }}" title="把当前笔记快照发布到知识库并归档到某个层级">📚 发布到知识库</button>
+          <form method="post" action="{{ web_base }}/{{ note.path }}/delete" onsubmit="return confirm('确定删除？');" style="display:inline;">
+            <button class="btn danger" type="submit">删除</button>
+          </form>
+          {% endif %}
+{% endblock %}
 {% block body %}
     <div class="wrap">
       <div class="layout">
-        <!-- 左列：topbar + 日志列表 -->
+        <!-- 左列：元信息 + 日志列表 -->
         <div class="left-col">
-          <div class="topbar">
-            <!-- 标题行 -->
-            <div class="topbar-head">
-              <div class="topbar-left">
-                <span id="dirty-dot" class="dirty-dot" title="有未保存的改动"></span>
-                <span class="title">{% if note %}编辑笔记{% else %}新建笔记{% endif %}</span>
-                {% if note %}<span class="badge">{{ note.path }}</span>{% endif %}
-              </div>
-              <div class="topbar-actions">
-                {% if login_user %}
-                <div class="login-chip">
-                  <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-                  <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-                </div>
-                {% endif %}
-                <a class="btn" href="{{ web_base }}">← 列表</a>
-                {% if note %}
-                <button class="btn" type="button" id="btn-publish-kb" data-path="{{ note.path }}" title="把当前笔记快照发布到知识库并归档到某个层级">📚 发布到知识库</button>
-                <form method="post" action="{{ web_base }}/{{ note.path }}/delete" onsubmit="return confirm('确定删除？');" style="display:inline;">
-                  <button class="btn danger" type="submit">删除</button>
-                </form>
-                {% endif %}
-              </div>
-            </div>
-            <!-- 时间行 -->
+          <div class="note-meta">
             {% if note %}
-            <div class="topbar-meta">
-              <span><span class="ts-label">创建 </span><span class="ts-val" data-ts="{{ note.created_at }}">{{ note.created_at }}</span></span>
-              <span><span class="ts-label">更新 </span><span class="ts-val" data-ts="{{ note.updated_at }}">{{ note.updated_at }}</span></span>
-            </div>
+            <span><span class="ts-label">创建 </span><span class="ts-val" data-ts="{{ note.created_at }}">{{ note.created_at }}</span></span>
+            <span><span class="ts-label">更新 </span><span class="ts-val" data-ts="{{ note.updated_at }}">{{ note.updated_at }}</span></span>
             {% else %}
-                <div class="topbar-meta"><span class="ts-label">创建后自动生成文件</span></div>
+            <span class="ts-label">创建后自动生成文件</span>
             {% endif %}
           </div>
 
@@ -1076,7 +1093,6 @@
         const STORAGE_PREFIX = "l_notepad_markdown_layout";
         const WIDTH_KEY      = STORAGE_PREFIX + "_preview_percent";
         const FLIP_KEY       = STORAGE_PREFIX + "_is_flipped";
-        const THEME_KEY       = STORAGE_PREFIX + "_theme";
         const SYNC_KEY       = STORAGE_PREFIX + "_scroll_sync";
 
         if (!titleInput || !contentInput) return;
@@ -1253,8 +1269,7 @@
           return window.localStorage.getItem(FLIP_KEY) === "1";
         }
         function getSavedTheme() {
-          const v = window.localStorage.getItem(THEME_KEY);
-          return v === "classic" ? "classic" : "windterm";
+          return window.LN && LN.prefs ? LN.prefs.editorTheme() : "windterm";
         }
         function setSplit(percent) {
           const safe = Math.min(75, Math.max(25, percent));
@@ -1267,10 +1282,17 @@
           window.localStorage.setItem(FLIP_KEY, flipped ? "1" : "0");
         }
         function applyTheme(theme) {
-          document.body.setAttribute("data-editor-theme", theme);
-          themeBtn.textContent = theme === "classic" ? "主题：默认" : "主题：WindTerm";
-          window.localStorage.setItem(THEME_KEY, theme);
+          const next = theme === "classic" ? "classic" : "windterm";
+          if (window.LN && LN.prefs) LN.prefs.setEditorTheme(next);
+          else document.body.setAttribute("data-editor-theme", next);
+          if (themeBtn) themeBtn.textContent = next === "classic" ? "主题：默认" : "主题：WindTerm";
         }
+        /* 顶栏「外观」改了编辑器主题时，同步工具栏按钮文案 */
+        document.addEventListener("ln:prefs", function (e) {
+          if (!themeBtn) return;
+          const t = e.detail && e.detail.theme === "classic" ? "classic" : "windterm";
+          themeBtn.textContent = t === "classic" ? "主题：默认" : "主题：WindTerm";
+        });
 
         // ── Markdown 预览（含内嵌脑图）──────────────────────
         function isMarkdownTitle(title) {
@@ -1599,8 +1621,8 @@
         swapBtn.addEventListener("click", function () {
           setFlip(!editorShell.classList.contains("is-flipped"));
         });
-        themeBtn.addEventListener("click", function () {
-          applyTheme(document.body.getAttribute("data-editor-theme") === "classic" ? "windterm" : "classic");
+        if (themeBtn) themeBtn.addEventListener("click", function () {
+          applyTheme(getSavedTheme() === "classic" ? "windterm" : "classic");
         });
 
         titleInput.addEventListener("input", function () {

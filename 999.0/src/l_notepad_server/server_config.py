@@ -34,7 +34,9 @@ def _is_prod() -> bool:
 
 
 # 生产入口：统一走 443（域名 + 正式证书）；开发机仍用本机 nginx 8080（只监听回环）
-_HOST_PREFIX = "https://lugwit.duckdns.org" if _is_prod() else "http://127.0.0.1:8080"
+# 域名来自 wuwo/config/config.yaml 的 domain（wuwo 注入 LUGWIT_DOMAIN_URL），换域名不用改代码
+_HOST_PREFIX = (os.environ.get("LUGWIT_DOMAIN_URL") or "https://lugwit.duckdns.org") \
+    if _is_prod() else "http://127.0.0.1:8080"
 _DEFAULTS = {
     "auth_url": _HOST_PREFIX,                      # 认证服务：nginx 入口（/api/v1/ → lugwit_auth）
     "auth_route": "/api/v1/auth",                  # 认证路由（login / verify / me 端点前缀）

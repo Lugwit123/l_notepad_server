@@ -584,37 +584,16 @@
         .side-section.notes-section { display: block; }
       }
 {% endblock %}
-{% block body %}
-    <div class="wrap">
-      <div class="topbar">
-        <div class="brand">
-          <div class="brand-mark"></div>
-          <div>
-            <div class="title">L Notepad</div>
-            <div class="subtitle">网页端日志中心</div>
-          </div>
-        </div>
-        <div class="actions">
-          {% if login_user %}
-          <div class="login-chip">
-            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-          </div>
-          {% endif %}
+{% block appbar_sub %}网页端日志中心{% endblock %}
+{% block appbar_actions %}
           <form class="search" method="get" action="{{ web_base }}" role="search" aria-label="搜索笔记">
             <span class="search-icon">🔍</span>
             <input name="q" value="{{ q }}" placeholder="搜索标题或内容…" aria-label="搜索" title="输入时即时按标题过滤；按回车进行标题+正文全文检索" />
           </form>
           <a class="btn primary" href="{{ web_base }}/new">新建</a>
-          <a class="btn" href="{{ web_base }}/kb" title="进入知识库">📚 知识库</a>
-          {% if is_admin %}
-          <a class="btn" href="{{ web_base }}/logs">服务日志</a>
-          <a class="btn" href="{{ root_base }}/admin/notes">管理</a>
-          {% endif %}
-          <a class="btn" href="{{ root_base }}/">状态页</a>
-        </div>
-      </div>
-
+{% endblock %}
+{% block body %}
+    <div class="wrap">
       <div class="workspace">
         <aside class="sidebar">
           <div class="sidebar-head">

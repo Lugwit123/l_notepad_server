@@ -80,4 +80,151 @@
         window.location.href = ROOT + "/login";
       });
   };
+
+  /* 全站外观偏好（base.html 顶栏「外观」菜单控制，localStorage 持久化） */
+  var PREF_THEME = "l_notepad_markdown_layout_theme";
+  var PREF_FONT = "l_notepad_ui_font";
+  var PREF_ACCENT = "l_notepad_ui_accent";
+
+  function prefGet(key, dflt) {
+    try {
+      return window.localStorage.getItem(key) || dflt;
+    } catch (e) {
+      return dflt;
+    }
+  }
+
+  function prefSet(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {}
+  }
+
+  var prefs = {
+    editorTheme: function () {
+      return prefGet(PREF_THEME, "windterm") === "classic" ? "classic" : "windterm";
+    },
+    font: function () {
+      var v = prefGet(PREF_FONT, "normal");
+      return v === "small" || v === "large" ? v : "normal";
+    },
+    accent: function () {
+      return prefGet(PREF_ACCENT, "blue");
+    },
+    setEditorTheme: function (v) {
+      prefSet(PREF_THEME, v === "classic" ? "classic" : "windterm");
+      this.apply();
+    },
+    setFont: function (v) {
+      prefSet(PREF_FONT, v === "small" || v === "large" ? v : "normal");
+      this.apply();
+    },
+    setAccent: function (v) {
+      prefSet(PREF_ACCENT, v || "blue");
+      this.apply();
+    },
+    /* 偏好 → <html> 属性（CSS 主题由属性选择器接管） */
+    apply: function () {
+      var html = document.documentElement;
+      html.setAttribute("data-editor-theme", prefs.editorTheme());
+      var font = prefs.font();
+      if (font === "normal") html.removeAttribute("data-ln-font");
+      else html.setAttribute("data-ln-font", font);
+      var accent = prefs.accent();
+      if (accent === "blue") html.removeAttribute("data-ln-accent");
+      else html.setAttribute("data-ln-accent", accent);
+      document.dispatchEvent(new CustomEvent("ln:prefs", { detail: { theme: prefs.editorTheme() } }));
+    }
+  };
+  LN.prefs = prefs;
+
+  /* 全局顶栏：导航菜单 + 外观菜单（base.html 注入，所有路由共享） */
+  (function () {
+    var navBtn = document.getElementById("app-nav-btn");
+    var navMenu = document.getElementById("app-nav-menu");
+    var themeBtn = document.getElementById("app-theme-btn");
+    var themeMenu = document.getElementById("app-theme-menu");
+    var segTheme = document.getElementById("seg-editor-theme");
+    var segFont = document.getElementById("seg-font");
+    var dotsAccent = document.getElementById("dots-accent");
+
+    function closeAll() {
+      if (navMenu && navBtn) {
+        navMenu.hidden = true;
+        navBtn.setAttribute("aria-expanded", "false");
+      }
+      if (themeMenu && themeBtn) {
+        themeMenu.hidden = true;
+        themeBtn.setAttribute("aria-expanded", "false");
+      }
+    }
+
+    function toggle(btn, menu) {
+      var open = menu.hidden;
+      closeAll();
+      if (open) {
+        menu.hidden = false;
+        btn.setAttribute("aria-expanded", "true");
+      }
+    }
+
+    function bindMenu(btn, menu) {
+      if (!btn || !menu) return;
+      btn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        toggle(btn, menu);
+      });
+      document.addEventListener("click", function (e) {
+        if (!menu.hidden && !menu.contains(e.target)) closeAll();
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") closeAll();
+      });
+    }
+
+    bindMenu(navBtn, navMenu);
+    bindMenu(themeBtn, themeMenu);
+
+    /* 分段选择态 */
+    function markGroup(container, value) {
+      if (!container) return;
+      [].forEach.call(container.querySelectorAll("button"), function (b) {
+        b.classList.toggle("active", b.getAttribute("data-value") === value);
+      });
+    }
+
+    function syncMenuState() {
+      markGroup(segTheme, prefs.editorTheme());
+      markGroup(segFont, prefs.font());
+      markGroup(dotsAccent, prefs.accent());
+    }
+
+    if (segTheme) {
+      segTheme.addEventListener("click", function (e) {
+        var b = e.target.closest("button");
+        if (!b) return;
+        prefs.setEditorTheme(b.getAttribute("data-value"));
+        syncMenuState();
+      });
+    }
+    if (segFont) {
+      segFont.addEventListener("click", function (e) {
+        var b = e.target.closest("button");
+        if (!b) return;
+        prefs.setFont(b.getAttribute("data-value"));
+        syncMenuState();
+      });
+    }
+    if (dotsAccent) {
+      dotsAccent.addEventListener("click", function (e) {
+        var b = e.target.closest("button");
+        if (!b) return;
+        prefs.setAccent(b.getAttribute("data-value"));
+        syncMenuState();
+      });
+    }
+
+    if (themeMenu) syncMenuState();
+    prefs.apply();
+  })();
 })();

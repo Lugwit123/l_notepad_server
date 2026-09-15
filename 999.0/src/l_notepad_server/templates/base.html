@@ -7,11 +7,265 @@
     <link rel="icon" href="{{ root_base }}/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="{{ _mounted_url(request, 'static/app.css') }}" />
     {% block head %}{% endblock %}
+    <script>
+      /* 外观偏好先落到 <html>，避免首帧闪回默认配色 */
+      (function () {
+        try {
+          var d = document.documentElement, s = window.localStorage;
+          d.setAttribute(
+            "data-editor-theme",
+            s.getItem("l_notepad_markdown_layout_theme") === "classic" ? "classic" : "windterm"
+          );
+          var f = s.getItem("l_notepad_ui_font");
+          if (f) d.setAttribute("data-ln-font", f);
+          var a = s.getItem("l_notepad_ui_accent");
+          if (a) d.setAttribute("data-ln-accent", a);
+        } catch (e) {}
+      })();
+    </script>
     <style>
       {% block page_style %}{% endblock %}
+
+      /* ══ 全站共享顶栏（base.html 注入，所有路由共用）══ */
+      .appbar {
+        position: fixed; top: 0; left: 0; right: 0;
+        height: 48px;
+        display: flex; align-items: center; gap: 10px;
+        padding: 0 10px;
+        background: rgba(9, 13, 24, 0.92);
+        border-bottom: 1px solid var(--border);
+        backdrop-filter: blur(18px) saturate(160%);
+        box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+        z-index: 800;
+      }
+      .appbar-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+      .appbar-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; min-width: 0; }
+      .appbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+      .appbar-brand {
+        display: flex; align-items: center; gap: 8px;
+        color: var(--text); text-decoration: none;
+        font-size: 13px; font-weight: 700; white-space: nowrap;
+      }
+      .appbar-brand:hover { color: var(--accent-bright); }
+      .appbar-mark {
+        width: 22px; height: 22px; border-radius: 7px;
+        background: linear-gradient(135deg, var(--accent), var(--cyan));
+        color: #06122b; font-size: 12px; font-weight: 800;
+        display: inline-flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+      }
+      .appbar-sub {
+        font-size: 11px; color: var(--muted);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+      }
+      .appbar-btn {
+        height: 30px; min-width: 30px; padding: 0 10px;
+        display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        color: var(--text); font-size: 12px; font-family: inherit; white-space: nowrap;
+        cursor: pointer; transition: 140ms ease;
+      }
+      .appbar-btn:hover { border-color: var(--accent-border); color: var(--accent-bright); }
+      .appbar-btn[aria-expanded="true"] {
+        border-color: var(--accent-border); color: var(--accent-bright);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .appbar-user {
+        display: flex; align-items: center; gap: 8px;
+        padding-left: 8px; border-left: 1px solid var(--border);
+      }
+      .appbar-user-name { font-size: 11px; color: var(--muted); white-space: nowrap; }
+      .appbar-menu { position: relative; }
+      /* 顶栏内复用页面按钮/搜索框时收紧尺寸 */
+      .appbar .btn { padding: 5px 10px; font-size: 12px; white-space: nowrap; }
+      .appbar .search-icon { left: 10px; font-size: 12px; }
+      .appbar .search input {
+        width: 240px; max-width: 30vw;
+        padding: 6px 12px 6px 30px; font-size: 12px;
+        background: rgba(8, 12, 26, 0.80);
+      }
+      /* 窄屏顶栏：副标题 / 用户名让位，搜索框收窄 */
+      @media (max-width: 860px) {
+        .appbar-sub { display: none; }
+        .appbar-user-name { display: none; }
+        .appbar-user { padding-left: 0; border-left: none; }
+      }
+      @media (max-width: 700px) {
+        .appbar-name { display: none; }
+        .appbar .search input { width: 130px; padding-right: 8px; }
+      }
+
+      /* 下拉浮层（导航 / 外观） */
+      .app-pop {
+        position: absolute; top: 38px; left: 0;
+        min-width: 190px; padding: 6px;
+        display: flex; flex-direction: column; gap: 2px;
+        background: var(--panel-strong);
+        border: 1px solid var(--border-hover);
+        border-radius: 12px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(20px) saturate(160%);
+        z-index: 820;
+      }
+      .app-pop[hidden] { display: none; }
+      .app-pop-title {
+        font-size: 10px; letter-spacing: 0.08em; color: var(--faint);
+        padding: 6px 8px 2px;
+      }
+      #app-theme-menu { left: auto; right: 0; min-width: 224px; }
+      .app-nav-item {
+        display: flex; align-items: center; gap: 8px;
+        padding: 7px 10px; border-radius: 8px;
+        font-size: 12px; color: var(--text); white-space: nowrap;
+        background: transparent; border: 1px solid transparent;
+        font-family: inherit; text-align: left; cursor: pointer;
+      }
+      .app-nav-item:hover { background: var(--accent-soft); color: var(--accent-bright); }
+      .app-nav-item.active {
+        background: var(--accent-soft);
+        border-color: var(--accent-border);
+        color: var(--accent-bright); font-weight: 600;
+      }
+      .app-nav-ico { width: 14px; text-align: center; flex-shrink: 0; }
+      .app-nav-sep { height: 1px; margin: 5px 2px; background: var(--border); }
+
+      /* 外观菜单：分段选择 + 强调色圆点 */
+      .seg { display: flex; gap: 4px; padding: 0 6px 4px; }
+      .seg button {
+        flex: 1; padding: 6px 4px; font-size: 11px; font-family: inherit;
+        border-radius: 7px; cursor: pointer;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
+      .seg button.active {
+        background: var(--accent-soft); border-color: var(--accent-border);
+        color: var(--accent-bright); font-weight: 600;
+      }
+      .dots { display: flex; gap: 6px; padding: 2px 8px 6px; }
+      .dots button {
+        width: 20px; height: 20px; padding: 0; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: transparent; border: 1px solid rgba(255, 255, 255, 0.18); cursor: pointer;
+      }
+      .dots button i { display: block; width: 12px; height: 12px; border-radius: 50%; }
+      .dots button.active { border-color: var(--text); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+      /* 强调色主题 */
+      html[data-ln-accent="cyan"] {
+        --accent: #38d4cc; --accent-bright: #5ee6df;
+        --accent-soft: rgba(56, 212, 204, 0.14); --accent-border: rgba(56, 212, 204, 0.38);
+        --accent-glow: rgba(56, 212, 204, 0.18);
+      }
+      html[data-ln-accent="violet"] {
+        --accent: #a78bfa; --accent-bright: #c4b1ff;
+        --accent-soft: rgba(167, 139, 250, 0.16); --accent-border: rgba(167, 139, 250, 0.40);
+        --accent-glow: rgba(167, 139, 250, 0.20);
+      }
+      html[data-ln-accent="orange"] {
+        --accent: #fb923c; --accent-bright: #ffb173;
+        --accent-soft: rgba(251, 146, 60, 0.14); --accent-border: rgba(251, 146, 60, 0.38);
+        --accent-glow: rgba(251, 146, 60, 0.18);
+      }
+      html[data-ln-accent="green"] {
+        --accent: #4ade80; --accent-bright: #77eb9d;
+        --accent-soft: rgba(74, 222, 128, 0.14); --accent-border: rgba(74, 222, 128, 0.36);
+        --accent-glow: rgba(74, 222, 128, 0.18);
+      }
+      html[data-ln-accent="pink"] {
+        --accent: #f472b6; --accent-bright: #ff9ccd;
+        --accent-soft: rgba(244, 114, 182, 0.14); --accent-border: rgba(244, 114, 182, 0.36);
+        --accent-glow: rgba(244, 114, 182, 0.18);
+      }
+
+      /* 界面字号：整体缩放内容区（顶栏保持原尺寸） */
+      html[data-ln-font="small"] body.has-app-nav .wrap { zoom: 0.94; }
+      html[data-ln-font="large"] body.has-app-nav .wrap { zoom: 1.06; }
+      /* 编辑页高度由 JS 按视口算，缩放会算错；改为只缩放正文/预览 */
+      html[data-ln-font="small"] body[data-page="note-edit"] .wrap { zoom: 1; }
+      html[data-ln-font="large"] body[data-page="note-edit"] .wrap { zoom: 1; }
+      html[data-ln-font="small"] body[data-page="note-edit"] .markdown-body { zoom: 0.94; }
+      html[data-ln-font="large"] body[data-page="note-edit"] .markdown-body { zoom: 1.06; }
+
+      /* 让出顶栏：内容下移，吸顶元素同步下移 */
+      body.has-app-nav { padding-top: 56px; }
+      body.has-app-nav .left-col { top: 66px; max-height: calc(100vh - 76px); }
+      body.has-app-nav .sidebar { top: 66px; max-height: calc(100vh - 76px); }
+      /* 知识库工作区内部已是满高容器，维持原样 */
+      body.has-app-nav .ws-panel .sidebar { top: auto; max-height: none; height: 100%; }
     </style>
   </head>
-  <body data-root="{{ root_base }}" data-web="{{ web_base }}">
+    {% set _nav_on = login_user and not request.url.path.rstrip('/').endswith('/login') %}
+  <body class="{% if _nav_on %}has-app-nav{% endif %}" data-page="{% block page_id %}{% endblock %}" data-root="{{ root_base }}" data-web="{{ web_base }}">
+    {% if _nav_on %}
+    {# 路由前缀（root_path / X-Forwarded-Prefix）可能已包含在 request.url.path 里，先剥掉再比较 #}
+    {% set _rl = root_base|length %}
+    {% set _rel = request.url.path[_rl:] if request.url.path.startswith(root_base) else request.url.path %}
+    {% set _rel = _rel.rstrip('/') %}
+    {% set _web_rel = web_base[_rl:] %}
+    {% set _kb_rel = _web_rel + '/kb' %}
+    <header class="appbar" role="banner">
+      <div class="appbar-left">
+        <div class="appbar-menu">
+          <button type="button" id="app-nav-btn" class="appbar-btn" aria-expanded="false" aria-controls="app-nav-menu" title="导航菜单">☰</button>
+          <div id="app-nav-menu" class="app-pop" hidden>
+            <a class="app-nav-item {% if _rel == '' %}active{% endif %}" href="{{ _mounted_url(request, '') }}"><span class="app-nav-ico">🏠</span>首页</a>
+            <a class="app-nav-item {% if _rel == _web_rel %}active{% endif %}" href="{{ web_base }}"><span class="app-nav-ico">📋</span>笔记列表</a>
+            <a class="app-nav-item {% if _rel == _web_rel + '/new' %}active{% endif %}" href="{{ web_base }}/new"><span class="app-nav-ico">✏️</span>新建笔记</a>
+            <a class="app-nav-item {% if _rel == _kb_rel or _rel.startswith(_kb_rel + '/') %}active{% endif %}" href="{{ web_base }}/kb"><span class="app-nav-ico">📚</span>知识库</a>
+            {% if is_admin %}
+            <div class="app-nav-sep"></div>
+            <a class="app-nav-item {% if _rel == _web_rel + '/logs' %}active{% endif %}" href="{{ web_base }}/logs"><span class="app-nav-ico">📜</span>服务日志</a>
+            <a class="app-nav-item {% if _rel == '/admin/notes' %}active{% endif %}" href="{{ root_base }}/admin/notes"><span class="app-nav-ico">⚙️</span>笔记管理</a>
+            {% endif %}
+            <div class="app-nav-sep"></div>
+            <a class="app-nav-item" href="{{ root_base }}/docs" target="_blank" rel="noopener"><span class="app-nav-ico">📘</span>API 文档</a>
+          </div>
+        </div>
+        <a class="appbar-brand" href="{{ _mounted_url(request, '') }}">
+          <span class="appbar-mark">N</span>
+          <span class="appbar-name">L Notepad</span>
+        </a>
+        <span class="appbar-sub">{% block appbar_sub %}{% endblock %}</span>
+      </div>
+
+      <div class="appbar-actions">{% block appbar_actions %}{% endblock %}</div>
+
+      <div class="appbar-right">
+        <div class="appbar-menu">
+          <button type="button" id="app-theme-btn" class="appbar-btn" aria-expanded="false" aria-controls="app-theme-menu" title="外观设置">🎨 外观</button>
+          <div id="app-theme-menu" class="app-pop" hidden>
+            <div class="app-pop-title">编辑器主题</div>
+            <div class="seg" id="seg-editor-theme">
+              <button type="button" data-value="windterm">WindTerm</button>
+              <button type="button" data-value="classic">默认</button>
+            </div>
+            <div class="app-pop-title">界面字号</div>
+            <div class="seg" id="seg-font">
+              <button type="button" data-value="small">小</button>
+              <button type="button" data-value="normal">标准</button>
+              <button type="button" data-value="large">大</button>
+            </div>
+            <div class="app-pop-title">强调色</div>
+            <div class="dots" id="dots-accent">
+              <button type="button" data-value="blue" title="科技蓝"><i style="background:#5b9cff"></i></button>
+              <button type="button" data-value="cyan" title="青色"><i style="background:#38d4cc"></i></button>
+              <button type="button" data-value="violet" title="紫色"><i style="background:#a78bfa"></i></button>
+              <button type="button" data-value="orange" title="橙色"><i style="background:#fb923c"></i></button>
+              <button type="button" data-value="green" title="绿色"><i style="background:#4ade80"></i></button>
+              <button type="button" data-value="pink" title="粉色"><i style="background:#f472b6"></i></button>
+            </div>
+          </div>
+        </div>
+        <div class="appbar-user">
+          <span class="appbar-user-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
+          <button type="button" class="appbar-btn" onclick="doLogout()" title="退出登录">登出</button>
+        </div>
+      </div>
+    </header>
+    {% endif %}
     {% block body %}{% endblock %}
     <script src="{{ _mounted_url(request, 'static/app.js') }}"></script>
     {% block page_script %}{% endblock %}

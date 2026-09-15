@@ -157,28 +157,12 @@
         .actions { justify-content: space-between; }
       }
 {% endblock %}
+{% block appbar_sub %}{{ kb.title }} · 工作区笔记 · 百度云版本库 /{{ kb.name }}{% endblock %}
+{% block appbar_actions %}
+          <a class="btn" href="{{ web_base }}/kb">← 知识库</a>
+{% endblock %}
 {% block body %}
     <div class="wrap">
-      <div class="topbar">
-        <div class="brand">
-          <div class="brand-mark">K</div>
-          <div>
-            <div class="title">{{ kb.title }}</div>
-            <div class="subtitle">工作区笔记 · 百度云版本库 /{{ kb.name }}</div>
-          </div>
-        </div>
-        <div class="actions">
-          {% if login_user %}
-          <div class="login-chip">
-            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-          </div>
-          {% endif %}
-          <a class="btn" href="{{ web_base }}/kb">← 知识库</a>
-          <a class="btn" href="{{ web_base }}">← 网页端</a>
-        </div>
-      </div>
-
       <div class="ws-panel" id="ws-panel">
         <aside class="sidebar">
           <div class="sidebar-head">

@@ -49,27 +49,9 @@
       .create-row input:focus { border-color: var(--accent-border); }
       .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
 {% endblock %}
+{% block appbar_sub %}知识库 · 多篇文章与目录层级{% endblock %}
 {% block body %}
     <div class="wrap">
-      <div class="topbar">
-        <div class="brand">
-          <div class="brand-mark">K</div>
-          <div>
-            <div class="title">知识库</div>
-            <div class="subtitle">每个知识库有自己的路由，内含多篇文章与目录层级</div>
-          </div>
-        </div>
-        <div class="actions">
-          {% if login_user %}
-          <div class="login-chip">
-            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-          </div>
-          {% endif %}
-          <a class="btn" href="{{ web_base }}">← 网页端</a>
-        </div>
-      </div>
-
       <div class="grid" id="kb-grid"></div>
 
       <div class="create-panel">

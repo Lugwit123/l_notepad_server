@@ -252,32 +252,13 @@
       @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
       @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .topbar { flex-direction: column; align-items: stretch; } }
 {% endblock %}
+{% block appbar_sub %}后端状态页{% endblock %}
+{% block appbar_actions %}
+          <a class="btn primary" href="{{ web_base }}">进入网页端</a>
+          <a class="btn" href="{{ root_base }}/docs" target="_blank" rel="noopener">API 文档</a>
+{% endblock %}
 {% block body %}
     <div class="wrap">
-      <!-- Topbar -->
-      <div class="topbar">
-        <div class="brand">
-          <div class="brand-mark"></div>
-          <div>
-            <div class="brand-title">L Notepad</div>
-            <div class="brand-sub">后端状态页</div>
-          </div>
-        </div>
-        <div class="topbar-right">
-          {% if login_user %}
-          <div class="login-chip">
-            <span class="login-name">👤 {{ login_user }}{% if login_role %} · {{ login_role }}{% endif %}</span>
-            <button type="button" class="login-logout" onclick="doLogout()">登出</button>
-          </div>
-          {% endif %}
-          <a class="btn primary" href="{{ web_base }}">进入网页端</a>
-          {% if is_admin %}
-          <a class="btn" href="{{ web_base }}/logs">服务日志</a>
-          {% endif %}
-          <a class="btn" href="{{ root_base }}/docs" target="_blank" rel="noopener">API 文档</a>
-        </div>
-      </div>
-
       <!-- 状态横幅 -->
       <div class="status-banner">
         <div class="status-icon">✓</div>
