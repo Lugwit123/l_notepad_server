@@ -33,7 +33,9 @@ from . import db as dbmod
 from . import file_store
 from . import note_access
 from . import paths
-from .routers import accounts, admin, kb, logs, notes, web
+from . import search_index
+from . import search_vec
+from .routers import accounts, admin, kb, logs, notes, search, web
 
 from pytracemp import lprint
 
@@ -71,6 +73,32 @@ PUBLIC_PATHS = (
     # 302 到登录页，导致"开关看不见状态"。只读状态 + 受 .dev_mod 硬门控，暴露无风险。
     "/__dev__/src_watch",
 )
+
+# ── 本机直连免 token ──────────────────────────────────────
+# 只对「直连后端（未经反代）且对端是回环地址」的**只读**请求免鉴权，便于本机脚本/curl/
+# 托盘等直接调 `/api/search`、`/api/kb/**` 调试；身份按 guest 走，权限过滤照旧生效。
+#
+# 安全性依赖两点：
+#   1) 必须没有 X-Real-IP / X-Forwarded-For —— nginx 反代会写入真实客户端 IP
+#      （`proxy_set_header X-Real-IP $remote_addr`），所以经反代的请求**从不解禁**；
+#      否则同机 nginx 会把所有远程请求都伪装成 127.0.0.1。
+#   2) 必须同时满足对端 IP 是回环，因此即使有人把后端绑到 0.0.0.0，远程直连也不会免鉴权。
+# 关闭方式：L_NOTEPAD_LOCAL_NO_AUTH=0。
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _local_no_auth_enabled() -> bool:
+    return os.environ.get("L_NOTEPAD_LOCAL_NO_AUTH", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _is_local_direct(request: Request) -> bool:
+    """本机直连后端（未经反代 + 对端回环）。"""
+    if request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For"):
+        return False
+    host = (request.client.host if request.client else "") or ""
+    return host in _LOCAL_HOSTS
 
 
 def create_dev_app() -> FastAPI:
@@ -127,6 +155,15 @@ def create_app(db_path: Path) -> FastAPI:
     file_store.ensure_root(notes_root)
     app.state.notes_root = notes_root
 
+    # 搜索索引：订阅笔记变更通知（索引在首次查询时惰性增量构建）
+    search_index.install()
+    # 向量（语义检索）表：vec_docs / vec_chunks，未启 embedding 时只是空表
+    try:
+        search_vec.init_schema(conn)
+        search_vec.bind_db_path(db_path)
+    except Exception:
+        pass
+
     # ── 百度网盘云端镜像（可选）：笔记本地 + 云端双向同步 ──
     try:
         from . import cloud_sync
@@ -149,6 +186,7 @@ def create_app(db_path: Path) -> FastAPI:
         conn.close()
 
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.state.static_dir = static_dir   # 静态资源指纹（?v=）用，见 routers/deps.static_url
 
     # ── 响应压缩（长列表 / 大笔记的 HTML 传输体积可降 ~70%）──
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -156,10 +194,17 @@ def create_app(db_path: Path) -> FastAPI:
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
         resp = await call_next(request)
+        # 静态资源 / 页面不走启发式缓存：客户端是固定 profile 的 QtWebEngine，
+        # 缓存住旧 app.js 会让顶栏菜单点不开（改为每次用前 revalidate，正常走 304）。
+        if request.url.path.startswith("/static/") or str(
+            resp.headers.get("content-type", "")
+        ).startswith("text/html"):
+            resp.headers.setdefault("Cache-Control", "no-cache")
         # Skip CSP for auto-generated API docs (Swagger UI / ReDoc load CDN resources).
         if request.url.path in ("/docs", "/redoc"):
             return resp
         # Minimal CSP: keep scripts local (but allow inline scripts in existing templates).
+        # connect-src 额外放行本机托盘 ExecServer（知识库「本机模式」经它读写浏览器所在机器的目录）。
         resp.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -168,7 +213,7 @@ def create_app(db_path: Path) -> FastAPI:
             "img-src 'self' data:; "
             "style-src 'self' 'unsafe-inline'; "
             "script-src 'self' 'unsafe-inline'; "
-            "connect-src 'self'; "
+            "connect-src 'self' http://127.0.0.1:19527 http://localhost:19527; "
             "font-src 'self' data:;",
         )
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -180,6 +225,14 @@ def create_app(db_path: Path) -> FastAPI:
     async def auth_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.url.path
         if path in PUBLIC_PATHS or path.startswith(PUBLIC_PATHS):
+            return await call_next(request)
+        # 本机直连（127.0.0.1:8765，未经反代）的只读请求免 token → 身份按 guest 处理，
+        # 仍走 note_access 权限过滤（看不到他人笔记；知识库对所有登录用户可见）。
+        if (
+            request.method in ("GET", "HEAD")
+            and _local_no_auth_enabled()
+            and _is_local_direct(request)
+        ):
             return await call_next(request)
         # 优先 Authorization header，其次 cookie（浏览器 reload 场景）
         token = None
@@ -250,6 +303,7 @@ def create_app(db_path: Path) -> FastAPI:
     # ── 路由分域注册（原先 789 行单文件按 domain 拆分）──
     app.include_router(notes.router)
     app.include_router(notes.meta_router)
+    app.include_router(search.router)
     app.include_router(logs.router)
     app.include_router(admin.router)
     app.include_router(accounts.router)

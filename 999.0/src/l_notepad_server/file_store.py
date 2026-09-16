@@ -12,19 +12,30 @@ from typing import Callable, Iterable
 from . import paths
 
 
-# ── 本地笔记变更钩子：云端镜像同步（cloud_sync）注册进来，笔记增删改后据此推送 ──
-_note_change_hook: "Callable[[str, str], None] | None" = None
+# ── 本地笔记变更钩子：云端镜像同步（cloud_sync）、搜索索引（search_index）等注册进来 ──
+_note_change_hooks: "list[Callable[[str, str], None]]" = []
+
+
+def add_note_change_hook(hook: "Callable[[str, str], None]") -> None:
+    """注册笔记增删改回调（action: upsert/delete, rel_path）；重复注册只保留一份。"""
+    if hook not in _note_change_hooks:
+        _note_change_hooks.append(hook)
+
+
+def remove_note_change_hook(hook: "Callable[[str, str], None]") -> None:
+    if hook in _note_change_hooks:
+        _note_change_hooks.remove(hook)
 
 
 def set_note_change_hook(hook: "Callable[[str, str], None] | None") -> None:
-    """注册笔记增删改回调（action: upsert/delete, rel_path）。None 表示卸载。"""
-    global _note_change_hook
-    _note_change_hook = hook
+    """替换全部订阅者（None 表示全部卸载）。"""
+    _note_change_hooks.clear()
+    if hook is not None:
+        _note_change_hooks.append(hook)
 
 
 def _notify_note_change(action: str, rel_path: str) -> None:
-    hook = _note_change_hook
-    if hook is not None:
+    for hook in list(_note_change_hooks):
         try:
             hook(action, rel_path)
         except Exception:

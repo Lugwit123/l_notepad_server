@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
-"""服务器地址配置：持久化到 ~/.Lugwit/l_notepad/server_config.json。
+"""服务器地址配置：持久化到 ~/.Lugwit/l_notepad_server/server_config.json。
 
-读写逻辑由 l_qframelesswindow 标题栏库的 ServerConfigStore 提供（标题栏
-「服务器设置」对话框写出的就是同一份配置）；本模块仅绑定数据目录、
-默认值与环境变量映射，并保留模块级便捷函数，供各消费方直接使用。
+读写逻辑由 l_qframelesswindow 标题栏库的 ServerConfigStore 提供；本模块仅绑定
+数据目录、默认值与环境变量映射，并保留模块级便捷函数，供各消费方直接使用。
 
 优先级：UI 持久化配置 > 环境变量 > 默认值。
-host 默认值由系统级环境变量 Lugwit_deploy 自动区分：
-    开发机（缺省）        → 本机 nginx http://127.0.0.1:8080
-    公网部署机（Lugwit_deploy=1）→ 生产 nginx 统一入口 http://121.196.144.88:8080
+
+host 默认值固定为本机 nginx 回环入口 http://127.0.0.1:8080（开发机 / 公网机一致）：
+本模块服务的是**服务端进程**（笔记后端 8765 调认证服务 1027 做登录与 token 校验），
+调用与认证服务同机，必须走回环。曾按 Lugwit_deploy 让公网机走域名/公网 IP
+（https://lugwit.duckdns.org 或 https://121.196.144.88），两条都会让服务端登录全挂：
+  - 域名入口：本机解析 / 回环 SNI 在部分网络下不通（duckdns 尤甚）；
+  - 裸 IP 入口：入口用自签证书，urllib 默认校验证书 → SSL CERTIFICATE_VERIFY_FAILED。
+两种异常原先都在 auth.login 里被吞成 401「用户名或密码错误」，表现为"谁都登不上"。
     auth_route = /api/v1/auth（登录 / verify / me 端点拼在 auth_url 之后，
-                               公网登录路由即 http://121.196.144.88:8080/api/v1/auth/login）
+                               即 http://127.0.0.1:8080/api/v1/auth/login）
     api_url / log_server_url = <host>/note（location /note/ 剥前缀转发到笔记后端 8765）
 
 注意：本模块不得依赖 PySide6/Qt，以便非 UI 模块（auth、backend_server 等）直接使用。
@@ -25,18 +29,11 @@ from l_qframelesswindow.server_config import ServerConfigStore
 from . import paths
 
 # 服务器类型 -> (默认地址, 环境变量名)
-# host 由系统级环境变量 Lugwit_deploy 自动区分（开发机=本机 nginx 127.0.0.1:8080；
-# 公网部署机=生产 nginx 8080 统一入口，location /api/v1/ → lugwit_auth，
-# /note/ 剥前缀转发到笔记后端 8765）。8765 只监听 127.0.0.1，不对外暴露端口。
-def _is_prod() -> bool:
-    """公网部署机标记：系统级环境变量 Lugwit_deploy=1。0/缺省 = 开发机。"""
-    return os.environ.get("Lugwit_deploy", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-# 生产入口：统一走 443（域名 + 正式证书）；开发机仍用本机 nginx 8080（只监听回环）
-# 域名来自 wuwo/config/config.yaml 的 domain（wuwo 注入 LUGWIT_DOMAIN_URL），换域名不用改代码
-_HOST_PREFIX = (os.environ.get("LUGWIT_DOMAIN_URL") or "https://lugwit.duckdns.org") \
-    if _is_prod() else "http://127.0.0.1:8080"
+# host 固定走本机 nginx 回环入口（127.0.0.1:8080，只监听本机）：
+# location /api/v1/ → lugwit_auth(1027)，/note/ 剥前缀转发到笔记后端 8765。
+# 8765 只监听 127.0.0.1，不对外暴露端口。客户端侧的服务器地址（桌面端登录用）
+# 在 l_notepad_client/server_config.py，与本模块的默认值互不影响。
+_HOST_PREFIX = "http://127.0.0.1:8080"
 _DEFAULTS = {
     "auth_url": _HOST_PREFIX,                      # 认证服务：nginx 入口（/api/v1/ → lugwit_auth）
     "auth_route": "/api/v1/auth",                  # 认证路由（login / verify / me 端点前缀）

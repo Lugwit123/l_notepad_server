@@ -157,8 +157,12 @@
         .actions { justify-content: space-between; }
       }
 {% endblock %}
-{% block appbar_sub %}{{ kb.title }} · 工作区笔记 · 百度云版本库 /{{ kb.name }}{% endblock %}
+{% block appbar_sub %}{{ kb.title }} · 工作区笔记 · 版本库 {{ depot_base or ('/notes/' + kb.name) }}{% endblock %}
 {% block appbar_actions %}
+          <form class="appbar-search" role="search" aria-label="搜索本知识库" onsubmit="return false;">
+            <span class="search-icon">🔍</span>
+            <input id="kb-search-input" placeholder="搜索本知识库内容…" aria-label="搜索" title="走倒排索引在本知识库工作区里检索；清空即回到文件树" />
+          </form>
           <a class="btn" href="{{ web_base }}/kb">← 知识库</a>
 {% endblock %}
 {% block body %}
@@ -185,6 +189,8 @@
             <div class="article-actions">
               <button class="btn sm primary" type="button" id="btn-ws-upload">➕ 上传本地文件</button>
               <button class="btn sm" type="button" id="btn-ws-set">设置工作区</button>
+              <button class="btn sm" type="button" id="tray-state" title="托盘连接状态（点击看详情）">🔌 托盘：探测中…</button>
+              <button class="btn sm" type="button" id="btn-depot" title="版本库归档位置（点击可改库内子路径）">归档：…</button>
               <button class="btn sm" type="button" id="btn-ws-edit" style="display:none;">✏ 编辑</button>
               <button class="btn sm danger" type="button" id="btn-ws-submit" style="display:none;">⬆ 提交为新版本</button>
             </div>
@@ -208,8 +214,8 @@
     <div id="toast" role="status" aria-live="polite"></div>
 {% endblock %}
 {% block page_script %}
-    <script src="{{ _mounted_url(request, 'static/purify.min.js') }}"></script>
-    <script src="{{ _mounted_url(request, 'static/marked.umd.min.js') }}"></script>
+    <script src="{{ static_url(request, 'purify.min.js') }}"></script>
+    <script src="{{ static_url(request, 'marked.umd.min.js') }}"></script>
     <script>
       (function () {
         const root = "{{ root_base }}";
@@ -227,6 +233,77 @@
         let wsEditMode = false;
         let wsEditContent = "";
         let wsEditMeta = "";
+
+        // ── 本机文件适配 ──────────────────────────────────────────
+        // 后端部署在远程机时，/api/kb/*/workspace 读的是「服务器」磁盘；浏览器所在
+        // 机器上的目录只能经本机托盘 ExecServer（127.0.0.1:19527）的白名单动作读写。
+        // 托盘在线且提供 kb_ws_* 动作 → 本机模式（root 需用户在弹出的选择框中授权）；
+        // 否则回退服务端工作区。
+        const TRAY_URL = "http://127.0.0.1:19527";
+        let trayReady = false;
+        let wsRoot = localStorage.getItem("kb_ws_root::" + kbName) || "";
+        let wsHint = "";  // 服务端配置的工作区路径：仅作本机选择框的默认位置
+
+        function trayCall(action, kwargs, timeout) {
+          const ctl = new AbortController();
+          const timer = setTimeout(function () { ctl.abort(); }, timeout || 60000);
+          return fetch(TRAY_URL + "/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: action, kwargs: kwargs || {} }),
+            signal: ctl.signal
+          }).then(function (r) {
+            if (!r.ok) throw new Error("托盘 HTTP " + r.status);
+            return r.json();
+          }).then(function (resp) {
+            if (resp && resp.ok === false) throw new Error(resp.error || "托盘执行失败");
+            const data = (resp && resp.data) || {};
+            if (data.ok === false) throw new Error(data.error || "本机操作失败");
+            return data;
+          }).finally(function () { clearTimeout(timer); });
+        }
+
+        // 只有「托盘在线 + 已授权本机目录」才走本机读写；否则回退服务端工作区
+        function useLocal() { return trayReady && !!wsRoot; }
+
+        function probeTray(cb) {
+          const ctl = new AbortController();
+          const t0 = Date.now();
+          const timer = setTimeout(function () { ctl.abort(); }, 1500);
+          fetch(TRAY_URL + "/health", { signal: ctl.signal })
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.json();
+            })
+            .then(function (h) {
+              const actions = (h && h.web_actions) || [];
+              trayInfo.actions = actions;
+              trayInfo.ms = Date.now() - t0;
+              trayInfo.error = "";
+              trayReady = actions.indexOf("kb_ws_list") !== -1;
+              trayInfo.ready = trayReady;
+            })
+            .catch(function (e) {
+              trayReady = false;
+              trayInfo.ready = false;
+              trayInfo.ms = Date.now() - t0;
+              trayInfo.actions = [];
+              trayInfo.error = String((e && e.message) || e);
+            })
+            .finally(function () {
+              clearTimeout(timer);
+              // 托盘在线：拉一次「已授权本机目录」用于展示
+              if (trayReady) {
+                trayCall("kb_ws_roots", {}, 3000)
+                  .then(function (d) { trayInfo.roots = (d && d.roots) || []; })
+                  .catch(function () { trayInfo.roots = []; })
+                  .finally(function () { renderTrayState(); if (cb) cb(); });
+                return;
+              }
+              renderTrayState();
+              if (cb) cb();
+            });
+        }
 
         function toast(msg, type) {
           if (!toastEl) return;
@@ -251,14 +328,21 @@
         }
 
         function getLocalContent(rel) {
+          if (useLocal()) {
+            return trayCall("kb_ws_read", { root: wsRoot, rel: rel })
+              .then(function (d) { return d.content || ""; });
+          }
           return api("/api/kb/" + kbName + "/workspace/file?path=" + encodeURIComponent(rel))
             .then(function (r) { return r.content || ""; });
         }
 
+        // 归档内容走知识库后端接口（映射到 depot 的 {library}/{subpath}/…）。
+        // 归档里还没有该文件时后端会报错 → 这里当"空内容"处理，状态比对会判为"未上传/已修改"。
         function getCloudContent(rel) {
-          const path = "/" + kbName + "/" + rel;
-          return fetch("/baidu/api/depot/download?path=" + encodeURIComponent(path) + "&rev=0")
-            .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); });
+          return fetch(root + "/api/kb/" + encodeURIComponent(kbName) +
+                       "/depot/file?rel=" + encodeURIComponent(rel))
+            .then(function (r) { return r.ok ? r.text() : ""; })
+            .catch(function () { return ""; });
         }
 
         function cmpContent(a, b) {
@@ -284,7 +368,7 @@
                 statusMap[rel] = { modified: !cmpContent(res[0], res[1]) };
               })
               .catch(function () { statusMap[rel] = { modified: false }; })
-              .then(function () { if (--pending === 0) finishStatus(allRels, cb); });
+              .finally(function () { if (--pending === 0) finishStatus(allRels, cb); });
           });
 
           function finishStatus(rels, cb) {
@@ -300,29 +384,15 @@
 
         function loadCloudStatus(cb) {
           cloudMap = {};
-          const depotBase = "/" + kbName;
-          function dl(dir, done) {
-            fetch("/baidu/api/depot/list?dir=" + encodeURIComponent(dir))
-              .then(function (r) { if (!r.ok) return done(); return r.json(); })
-              .then(function (j) {
-                const items = (j && j.items) || [];
-                const dirs = [];
-                items.forEach(function (i) {
-                  if (i.isdir) dirs.push(i.path);
-                  else {
-                    const rel = i.path.slice(depotBase.length).replace(/^\/+/, "");
-                    cloudMap[rel] = { rev: i.rev, path: i.path, remote_path: i.remote_path || "" };
-                  }
-                });
-                if (!dirs.length) return done();
-                let pending = dirs.length;
-                dirs.forEach(function (d) {
-                  dl(d, function () { if (--pending === 0) done(); });
-                });
-              })
-              .catch(function () { done(); });
-          }
-          dl(depotBase, cb || function () {});
+          api("/api/kb/" + encodeURIComponent(kbName) + "/depot/list")
+            .then(function (j) {
+              (j.items || []).forEach(function (i) {
+                if (i.isdir) return;   // 目录层级由本地/归档条目自身路径体现
+                cloudMap[i.rel] = { rev: i.rev, path: i.path, remote_path: i.remote_path || "", size: i.size };
+              });
+              cb && cb();
+            })
+            .catch(function () { cb && cb(); });
         }
 
         const folderOpen = {};
@@ -411,7 +481,46 @@
           });
         }
 
+        // ── 本知识库搜索：走 /api/search 倒排索引，命中结果替换左侧文件树 ──
+        let kbHits = null;        // null = 正常浏览模式
+        let kbSearchTimer = null;
+        let kbSearchInfo = null;  // 后端返回的检索元信息（命中数/耗时/语义命中）
+        let depotInfo = null;     // 版本库归档映射（库 / 子路径 / 工作区）
+
+        function renderKbSearchHits() {
+          wsTree.textContent = "";
+          const rows = kbHits || [];
+          if (!rows.length) {
+            wsTree.innerHTML = '<div class="reader-empty">未找到匹配的文档<br>换个关键词或清空搜索框返回文件树</div>';
+            wsMeta.textContent = "0 条命中";
+            return;
+          }
+          rows.forEach(function (h) {
+            const btn = document.createElement("button");
+            btn.className = "ws-item" + (h.rel === wsActiveRel ? " active" : "");
+            btn.innerHTML = '<span class="ws-ico">🔎</span><span>' + LN.esc(h.rel) + "</span>" +
+              '<span class="ws-cloud">' + Math.round((h.coverage || 0) * 100) + "%</span>";
+            btn.title = (h.snippet || "") + "\n覆盖率 " + h.coverage + " · 相关度 " + h.score;
+            btn.onclick = function () { openWsFile(h.rel); };
+            wsTree.appendChild(btn);
+          });
+          wsMeta.textContent = rows.length + " 条命中" +
+            (kbSearchInfo && kbSearchInfo.vec && kbSearchInfo.vec.used
+              ? "（语义 " + kbSearchInfo.vec.hits + " · " + (kbSearchInfo.took_ms || 0) + "ms）" : "");
+        }
+
+        function runKbSearch(q) {
+          api("/api/kb/" + encodeURIComponent(kbName) + "/search?limit=200&q=" + encodeURIComponent(q))
+            .then(function (r) {
+              kbHits = r.hits || [];       // 后端已按本知识库作用域过滤
+              kbSearchInfo = r;
+              renderWsTree();
+            })
+            .catch(function (e) { toast("搜索失败：" + e.message, "error"); });
+        }
+
         function renderWsTree() {
+          if (kbHits !== null) { renderKbSearchHits(); return; }
           wsTree.textContent = "";
           const rels = Object.keys(statusMap).sort();
           if (!rels.length) {
@@ -422,14 +531,41 @@
           wsMeta.textContent = rels.length + " 篇";
         }
 
-        function loadWorkspace() {
+        function loadWorkspace(cb) {
+          const done = function () { reconcileStatus(function () { renderWsTree(); if (cb) cb(); }); };
+          // 本机模式：列浏览器所在机器上「已授权」目录的文件（服务端不参与）
+          if (useLocal()) {
+            loadCloudStatus(function () {
+              if (!wsRoot) {
+                wsPath = "";
+                wsFiles = [];
+                sharedMap = {};
+                done();
+                return;
+              }
+              trayCall("kb_ws_list", { root: wsRoot }).then(function (d) {
+                wsPath = d.root || wsRoot;
+                wsFiles = (d.files || []).map(function (f) {
+                  return { rel: f.rel, name: f.name, size: f.size, mtime: f.mtime, shared: false };
+                });
+                sharedMap = {};
+                done();
+              }).catch(function (e) {
+                wsPath = wsRoot;
+                wsFiles = [];
+                done();
+                toast("本机目录不可用：" + e.message, "error");
+              });
+            });
+            return;
+          }
           loadCloudStatus(function () {
             api("/api/kb/" + kbName + "/workspace").then(function (r) {
               wsPath = r.workspace || "";
               wsFiles = r.files || [];
               sharedMap = {};
               (wsFiles || []).forEach(function (f) { if (f.shared) sharedMap[f.rel] = true; });
-              reconcileStatus(renderWsTree);
+              done();
             }).catch(function () {});
           });
         }
@@ -504,17 +640,24 @@
         function saveEdited() {
           if (!wsActiveRel || !wsEditMode) return;
           const newContent = document.getElementById("ws-editor").value;
-          api("/api/kb/" + kbName + "/workspace/file?path=" + encodeURIComponent(wsActiveRel), {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ content: newContent })
-          }).then(function () {
+          const done = function () {
             toast("已保存到工作区 ✓");
             exitEditMode();
             statusMap[wsActiveRel] = { modified: true };
             loadCloudStatus(function () { reconcileStatus(renderWsTree); });
             openWsFile(wsActiveRel);
-          }).catch(function (e) { toast("保存失败：" + e.message, "error"); });
+          };
+          const failed = function (e) { toast("保存失败：" + e.message, "error"); };
+          if (useLocal()) {
+            trayCall("kb_ws_write", { root: wsRoot, rel: wsActiveRel, content: newContent })
+              .then(done).catch(failed);
+            return;
+          }
+          api("/api/kb/" + kbName + "/workspace/file?path=" + encodeURIComponent(wsActiveRel), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: newContent })
+          }).then(done).catch(failed);
         }
         document.getElementById("btn-ws-edit").addEventListener("click", function () {
           if (wsEditMode) saveEdited(); else enterEditMode();
@@ -524,16 +667,17 @@
           const target = rel || wsActiveRel;
           if (!target) return;
           const st = statusMap[target] || {};
-          if (st.cloudOnly) { toast("该笔记仅在云端，无需提交", "info"); return; }
-          if (!st.modified && !st.localOnly) {
+          const known = Object.keys(st).length > 0;   // 状态未算出时不做"已同步"判断（按待上传处理）
+          if (known && st.cloudOnly) { toast("该笔记仅在云端，无需提交", "info"); return; }
+          if (known && !st.modified && !st.localOnly) {
             toast("该笔记未修改，跳过上传", "info");
             return;
           }
           if (!confirm("将工作区文件提交到百度云版本库？\n" + target)) return;
           getLocalContent(target).then(function (content) {
-            const depotPath = "/" + kbName + "/" + target;
             const desc = "提交 " + target;
-            return fetch("/baidu/api/depot/submit_stream?path=" + encodeURIComponent(depotPath) + "&description=" + encodeURIComponent(desc), {
+            return fetch(root + "/api/kb/" + encodeURIComponent(kbName) + "/depot/submit?rel=" +
+                         encodeURIComponent(target) + "&description=" + encodeURIComponent(desc), {
               method: "POST",
               headers: { "Content-Type": "application/octet-stream" },
               body: content
@@ -542,7 +686,7 @@
               return resp.json();
             });
           }).then(function () {
-            toast("已提交到百度云 ✓");
+            toast("已提交到版本库 ✓");
             loadCloudStatus(function () {
               reconcileStatus(renderWsTree);
             });
@@ -554,7 +698,10 @@
           if (!wsFiles.length) { toast("请先设置工作区（工作区需有 .md 文档）", "error"); return; }
           const local = wsFiles.filter(function (f) {
             const st = statusMap[f.rel] || {};
-            return st.localOnly || st.modified;
+            if (st.localOnly || st.modified) return true;
+            // 状态尚未算出（reconcileStatus 重算期间 statusMap 会短暂清空）：
+            // 归档里没有该文件就当作待上传
+            return Object.keys(st).length === 0 && !cloudMap[f.rel];
           });
           if (!local.length) {
             toast("所有本地文档均已同步到云端，无需上传", "info");
@@ -570,6 +717,17 @@
         });
 
         document.getElementById("btn-ws-set").addEventListener("click", function () {
+          // 本机模式：由托盘弹出文件夹选择框授权「浏览器所在机器」上的目录
+          if (trayReady) {
+            trayCall("kb_ws_grant", { hint: wsHint || wsPath || wsRoot }).then(function (d) {
+              wsRoot = d.root || "";
+              localStorage.setItem("kb_ws_root::" + kbName, wsRoot);
+              toast("已授权本机目录 ✓");
+              renderTrayState();
+              loadWorkspace();
+            }).catch(function (e) { toast("未授权：" + e.message, "info"); });
+            return;
+          }
           const p = prompt("设置该知识库的工作区目录（本地绝对路径，如 D:\\...\\Rez-Docs）：", wsPath);
           if (p === null) return;
           api("/api/kb/" + kbName + "/workspace", {
@@ -639,13 +797,102 @@
             submitToBaidu(submit.getAttribute("data-submit"));
           } else if (reveal) {
             wsMenu.style.display = "none";
-            api("/api/kb/" + kbName + "/workspace/reveal?path=" + encodeURIComponent(reveal.getAttribute("data-reveal")))
-              .then(function () { toast("已在资源管理器中打开目录"); })
+            const rel = reveal.getAttribute("data-reveal");
+            const req = useLocal()
+              ? trayCall("kb_ws_reveal", { root: wsRoot, rel: rel })
+              : api("/api/kb/" + kbName + "/workspace/reveal?path=" + encodeURIComponent(rel));
+            req.then(function () { toast("已在资源管理器中打开目录"); })
               .catch(function (err) { toast("打开失败：" + err.message, "error"); });
           }
         });
 
-        loadWorkspace();
+        // 顶栏搜索框：300ms 去抖检索本知识库；清空即恢复文件树
+        const kbSearchInput = document.getElementById("kb-search-input");
+        if (kbSearchInput) {
+          kbSearchInput.addEventListener("input", function () {
+            const q = kbSearchInput.value.trim();
+            if (kbSearchTimer) clearTimeout(kbSearchTimer);
+            if (!q) { kbHits = null; renderWsTree(); return; }
+            kbSearchTimer = setTimeout(function () { runKbSearch(q); }, 300);
+          });
+        }
+
+        // 托盘连接信息（显示在「🔌 托盘」按钮上，点击看详情）
+        let trayInfo = { ready: false, url: TRAY_URL, actions: [], error: "", ms: 0, roots: [] };
+
+        function trayModeText() {
+          if (useLocal()) return "本机模式（经托盘读写浏览器所在机器的磁盘）";
+          if (trayInfo.ready) return "服务端模式（托盘在线，但本知识库未授权本机目录）";
+          return "服务端模式（读服务器磁盘上的工作区目录）";
+        }
+
+        function renderTrayState() {
+          const el = document.getElementById("tray-state");
+          if (!el) return;
+          el.textContent = (trayInfo.ready ? "🔌 托盘：已连接" : "🔌 托盘：未连接") +
+            " · " + (useLocal() ? "本机" : "服务端");
+          const roots = trayInfo.roots || [];
+          el.title = [
+            "地址：" + trayInfo.url,
+            "状态：" + (trayInfo.ready
+              ? "已连接（" + trayInfo.ms + "ms，白名单动作 " + trayInfo.actions.length + " 个）"
+              : "未连接" + (trayInfo.error ? "：" + trayInfo.error : "")),
+            "模式：" + trayModeText(),
+            "本知识库授权目录：" + (wsRoot || "（未授权，点「选择本机目录」授权）"),
+            "托盘已授权目录（" + roots.length + "）：" + (roots.length ? roots.join("\n") : "（无）"),
+          ].join("\n");
+        }
+
+        document.getElementById("tray-state").addEventListener("click", function () {
+          alert("托盘连接信息\n\n" + this.title);
+        });
+
+        // 归档映射（depot 库 + 库内子路径），显示在「归档：/notes/xxx」按钮上
+        function loadDepotMapping() {
+          return api("/api/kb/" + encodeURIComponent(kbName) + "/depot").then(function (m) {
+            depotInfo = m;
+            const btn = document.getElementById("btn-depot");
+            if (btn) {
+              btn.textContent = "归档：" + (m.base_path || "");
+              btn.title = "库 " + m.library + " · 子路径 " + m.subpath + " · 工作区 " + m.ws_name +
+                (m.local_root ? "\n本地目录 " + m.local_root : "") + "\n点击可改库内子路径";
+            }
+            return m;
+          }).catch(function () { return null; });
+        }
+
+        function editDepotMapping() {
+          const cur = (depotInfo && depotInfo.subpath) || kbName;
+          const p = prompt("归档到库内子路径（库 = " +
+            ((depotInfo && depotInfo.library) || "/notes") + "）：", cur);
+          if (p === null || p.trim() === cur) return;
+          fetch(root + "/api/kb/" + encodeURIComponent(kbName) + "/depot", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ subpath: p.trim() })
+          }).then(function (r) {
+            if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+            return r.json();
+          }).then(function () { toast("归档位置已更新"); loadDepotMapping().then(loadWorkspace); })
+            .catch(function (e) { toast("修改失败：" + e.message, "error"); });
+        }
+        document.getElementById("btn-depot").addEventListener("click", editDepotMapping);
+
+        loadDepotMapping();
+        probeTray(function () {
+          const btnSet = document.getElementById("btn-ws-set");
+          if (trayReady && btnSet) {
+            btnSet.textContent = "📂 选择本机目录";
+            btnSet.title = "授权浏览器所在机器上的工作区目录（经本机托盘读写，不上传服务端）";
+            // 服务端配置的路径只作选择框默认位置；文件读写全程在本机
+            api("/api/kb/" + kbName + "/workspace")
+              .then(function (r) { wsHint = r.workspace || ""; })
+              .catch(function () {});
+          }
+          // 搜索跳转等深链：?file=<rel> 等工作区加载完成后自动打开该文件
+          const want = new URLSearchParams(location.search).get("file");
+          loadWorkspace(function () { if (want) openWsFile(want); });
+        });
         LN.fmtAll();
       })();
 

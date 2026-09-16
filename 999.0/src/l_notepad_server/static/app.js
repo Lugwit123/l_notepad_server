@@ -138,59 +138,22 @@
   };
   LN.prefs = prefs;
 
-  /* 全局顶栏：导航菜单 + 外观菜单（base.html 注入，所有路由共享） */
+  /* 顶栏「外观」菜单内容：分段选择 + 强调色。
+     菜单自身的开合由 base.html 内联脚本负责（不依赖本文件的加载与 hidden 属性）。 */
   (function () {
-    var navBtn = document.getElementById("app-nav-btn");
-    var navMenu = document.getElementById("app-nav-menu");
-    var themeBtn = document.getElementById("app-theme-btn");
-    var themeMenu = document.getElementById("app-theme-menu");
     var segTheme = document.getElementById("seg-editor-theme");
     var segFont = document.getElementById("seg-font");
     var dotsAccent = document.getElementById("dots-accent");
 
-    function closeAll() {
-      if (navMenu && navBtn) {
-        navMenu.hidden = true;
-        navBtn.setAttribute("aria-expanded", "false");
-      }
-      if (themeMenu && themeBtn) {
-        themeMenu.hidden = true;
-        themeBtn.setAttribute("aria-expanded", "false");
-      }
-    }
-
-    function toggle(btn, menu) {
-      var open = menu.hidden;
-      closeAll();
-      if (open) {
-        menu.hidden = false;
-        btn.setAttribute("aria-expanded", "true");
-      }
-    }
-
-    function bindMenu(btn, menu) {
-      if (!btn || !menu) return;
-      btn.addEventListener("click", function (e) {
-        e.stopPropagation();
-        toggle(btn, menu);
-      });
-      document.addEventListener("click", function (e) {
-        if (!menu.hidden && !menu.contains(e.target)) closeAll();
-      });
-      document.addEventListener("keydown", function (e) {
-        if (e.key === "Escape") closeAll();
-      });
-    }
-
-    bindMenu(navBtn, navMenu);
-    bindMenu(themeBtn, themeMenu);
-
     /* 分段选择态 */
     function markGroup(container, value) {
       if (!container) return;
-      [].forEach.call(container.querySelectorAll("button"), function (b) {
-        b.classList.toggle("active", b.getAttribute("data-value") === value);
-      });
+      var buttons = container.getElementsByTagName("button");
+      for (var i = 0; i < buttons.length; i++) {
+        var b = buttons[i];
+        if (b.getAttribute("data-value") === value) b.className = "active";
+        else b.className = String(b.className).replace(/\bactive\b/g, "");
+      }
     }
 
     function syncMenuState() {
@@ -199,32 +162,30 @@
       markGroup(dotsAccent, prefs.accent());
     }
 
-    if (segTheme) {
-      segTheme.addEventListener("click", function (e) {
-        var b = e.target.closest("button");
-        if (!b) return;
-        prefs.setEditorTheme(b.getAttribute("data-value"));
-        syncMenuState();
-      });
+    /* 找最近的 button 祖先（Element.closest 在老 IE 内核不存在） */
+    function closestButton(el) {
+      while (el && el !== document) {
+        if (String(el.tagName).toLowerCase() === "button") return el;
+        el = el.parentNode;
+      }
+      return null;
     }
-    if (segFont) {
-      segFont.addEventListener("click", function (e) {
-        var b = e.target.closest("button");
+
+    function bindGroup(container, apply) {
+      if (!container) return;
+      container.addEventListener("click", function (e) {
+        var b = closestButton(e.target || e.srcElement);
         if (!b) return;
-        prefs.setFont(b.getAttribute("data-value"));
-        syncMenuState();
-      });
-    }
-    if (dotsAccent) {
-      dotsAccent.addEventListener("click", function (e) {
-        var b = e.target.closest("button");
-        if (!b) return;
-        prefs.setAccent(b.getAttribute("data-value"));
+        apply(b.getAttribute("data-value"));
         syncMenuState();
       });
     }
 
-    if (themeMenu) syncMenuState();
+    bindGroup(segTheme, prefs.setEditorTheme.bind(prefs));
+    bindGroup(segFont, prefs.setFont.bind(prefs));
+    bindGroup(dotsAccent, prefs.setAccent.bind(prefs));
+
+    if (document.getElementById("app-theme-menu")) syncMenuState();
     prefs.apply();
   })();
 })();

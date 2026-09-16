@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -85,12 +86,54 @@ def mounted_url(request: Request, path: str) -> str:
     return f"{rb}/{path}" if rb else f"/{path}"
 
 
+# 静态资源指纹缓存 TTL：静态文件改动后 1 秒内新指纹生效（开发期改 app.js 刷新即见）
+_STATIC_VER_TTL_S = 1.0
+
+
+def static_version(request: Request) -> str:
+    """静态资源指纹：static/* 的 (mtime_ns, size) 混算。
+
+    用于给 <script>/<link> 拼 ?v=，避免浏览器（QtWebEngine 固定 profile 的
+    持久缓存）继续用旧 app.js——旧脚本没有顶栏菜单绑定，表现为「按钮点了没反应」。
+    """
+    now = time.monotonic()
+    cached = getattr(request.app.state, "_static_ver", None)
+    if cached and now - cached[0] < _STATIC_VER_TTL_S:
+        return cached[1]
+    static_dir: Path | None = getattr(request.app.state, "static_dir", None)
+    if static_dir is None:
+        return ""
+    fingerprint = 0
+    try:
+        for path in sorted(static_dir.iterdir()):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            fingerprint = (fingerprint * 1000003) ^ (stat.st_mtime_ns * 31 + stat.st_size)
+    except OSError:
+        return ""
+    version = format(fingerprint & 0xFFFFFFFFFFFF, "x")
+    request.app.state._static_ver = (now, version)
+    return version
+
+
+def static_url(request: Request, name: str) -> str:
+    """带版本号的静态资源 URL（name 可写 'app.js' 或 'static/app.js'）。"""
+    path = name.lstrip("/")
+    if not path.startswith("static/"):
+        path = f"static/{path}"
+    url = mounted_url(request, path)
+    version = static_version(request)
+    return f"{url}?v={version}" if version else url
+
+
 def template_ctx(request: Request) -> dict[str, Any]:
     """所有模板共享的上下文（前缀 + 登录态 + helper）。"""
     return {
         "root_base": root_base(request),
         "web_base": web_base(request),
         "_mounted_url": mounted_url,
+        "static_url": static_url,
         **login_ctx(request),
     }
 

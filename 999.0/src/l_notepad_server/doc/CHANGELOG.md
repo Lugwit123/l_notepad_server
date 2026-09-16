@@ -1,5 +1,82 @@
 # L Notepad 更新日志
 
+## v3.0.0 (2026-09-16)
+
+### 变更（破坏性修正）
+- 🗂 **知识库归档映射修正**：原来把**知识库名当成 depot 库**（`/rez_pkg/xxx.md`），改为**库 `/notes` + 库内子路径**（`/notes/rez_pkg/xxx.md`）。新增 `depot_map.py`（不依赖 fastapi，可 headless 测试）：逻辑路径 = `{library}/{subpath}/{rel}`，`library` 默认 `/notes`、`subpath` 默认知识库名
+- 🧩 **工作区映射**：每个知识库对应一个 depot 工作区 `kb-<名>`（P4 client 语义），绑定库与本地目录，并登记 `maps=[{depot_path: {base_path}, local_path: ""}]` → 本地 `xxx.md` ↔ `/notes/<kb>/xxx.md` 一一对应；`knowledge_bases` 新增 `depot_library` / `depot_subpath` / `depot_ws` 三列（含迁移）
+- 🔀 **知识库页面不再直连 `/baidu/api/depot/*`**：列目录/读文件/提交/映射全部走后端接口
+  - `GET/PUT /api/kb/{kb}/depot`（映射查询/修改，改完自动重建工作区映射）
+  - `GET /api/kb/{kb}/depot/list?rel=`、`GET /api/kb/{kb}/depot/file?rel=&rev=`、`POST /api/kb/{kb}/depot/submit?rel=&description=`
+  - 页面顶栏新增「归档：/notes/xxx」按钮，点击可改库内子路径
+- 🔎 **知识库专用搜索接口** `GET /api/kb/{kb}/search?q=&mode=&limit=&offset=`：作用域在 SQL 内完成（`search_docs.kb_name`），前端不再"搜全部 kb 源再本地过滤"；`search_index.search()` 新增 `kb_name` 参数（词法/语义/权限过滤三处一致）
+- 🚚 存量数据迁移：旧库 `/rez_pkg` 下的 8 个归档已 move 到 `/notes/rez_pkg/`（含子目录），旧库无文件残留
+
+---
+
+## v2.9.0 (2026-09-16)
+
+### 新增功能
+- 🎛 **embedding 模型可切换**：状态页「语义检索」新增模型下拉（`bge-m3` / `bge-base-zh-v1.5` / `bge-small-zh-v1.5` / `nomic-embed-text`，显示维度/上下文/体积/是否已安装），选择写入 `app_settings.embed_model`（优先级：环境变量 `L_NOTEPAD_EMBED_MODEL` > 页面设置 > 自动挑）
+- ⬇ **切换未安装模型时提示下载，不主动下载**：`POST /api/search/model` 未安装只回 `need_download`（不下载、不切换），前端弹确认框；确认后才走 `POST /api/search/model/download`（Ollama `/api/pull` 流式进度，状态页显示下载百分比），下载完自动切换并提示重嵌
+- 🧩 `GET /api/search/models`：模型目录 + 当前模型 + 下载进度；切换模型时清理旧模型的向量记录（`vec_docs` + `vec_chunks`）并清内存缓存，向量与当前模型不匹配时语义自动降级（`available.stale`）
+- 📏 按模型自动调块大小：`chunk_size_for()` = min(900, ctx×0.8) 字符（bge-m3 8192→900；v1.5 系 512→**409**，避免尾部被截断），块重叠取块大小 1/8；`stats.chunk_size` 显示当前生效值
+- 🔤 v1.5 系查询 instruction：`bge-*-zh-v1.5` 查询自动加「为这个句子生成表示以用于检索相关文章：」前缀（文档侧不加），`needs_query_instruction()` 判定；bge-m3 / nomic 不加
+- 📊 阈值按模型标定（`vec_min()`）：实测本语料 bge-m3 负例 0.43-0.52 / 正例 0.65-0.70 → 阈值 **0.55**；bge-base-zh-v1.5 负例 0.23-0.29 / 正例 0.51-0.67 → 阈值 **0.35**（原来统一 0.45 会放进"今天天气不错"这类噪声）
+- 🔍 语义不可用时回传原因：`vec.reason`（`向量需重新嵌入` / `模型未安装`），`sem` 模式语义零命中不再返回"词法 total + 空列表"的误导结果
+- 🧪 双模型实测（真实 49 篇语料）：bge-base-zh-v1.5 与 bge-m3 的 top1 命中 4/5 一致、top3 集合一致；base-zh 模型小 5.8×、单块嵌入快约 4×（1437 块 18.2s vs 711 块 30-40s）、分数分离度更好 → **2C4G 服务器推荐 base-zh**；m3 在英文术语（`depot_blob`/`md5`）与超长文档上更强
+- 🧠 **语义检索（向量）**：新增 `search_vec.py`——文档按段分块（900 字符、120 重叠）→ 本机 Ollama embedding（`/api/embed` 批量，回退 `/api/embeddings`）→ 归一化 float32 存 `vec_chunks`（`vec_docs` 记 mtime/size 做增量）；查询侧点积即余弦，每篇取最高分块分
+- 🔀 混合检索：`GET /api/search?...&mode=hybrid|lex|sem`。`hybrid`（默认）= 词法结果 + 语义加分，**词法零命中时用语义兜底**；`sem` = 纯语义。命中项新增 `vec` 分数字段；`total` 计入语义补充的文档
+- 🔎 摘要与高亮：摘要改为「短语优先 → 命中词块最密集窗口」定位；命中词以 `<mark>` 高亮（相邻/重叠区间合并，如「创建」+「建包」合成「创建包」），列表页服务端渲染（先转义再插标签，防 XSS），索引页试搜按 `matches` 前端高亮
+- 🧮 状态页新增「语义检索（向量）」区块：可用性 / 模型 / 已嵌文档与块数 / 维度 / 进度条；`POST /api/search/embed_async[?force=1]`（管理员）后台增量或全量重嵌
+- ⚙️ embedding 配置：`L_NOTEPAD_EMBED_URL`（默认 `http://127.0.0.1:11434`）、`L_NOTEPAD_EMBED_MODEL`（缺省自动挑 bge-m3 → bge-large-zh → nomic-embed-text）、`L_NOTEPAD_VEC_ENABLED=0` 可整体关闭
+
+### 注意
+- 中文语义质量取决于模型：`nomic-embed-text` 偏英文（实测「部署流程」误召回无关文档），已改为优先 `bge-m3`（多语言）。换模型后状态页点「全量重嵌」即可（`vec_docs.model` 与当前模型不一致会自动重嵌）
+
+---
+
+## v2.8.0 (2026-09-16)
+
+### 新增功能
+- 🔎 **搜索索引状态页** `/web/index`（左上角导航「搜索索引」）：索引总览（文档数 / 倒排行数 / 索引体积 / 待处理队列 / 扫描间隔 / 单文件上限）、分来源明细（根目录、文档数、最后索引时间、目录不存在告警）、**磁盘校对**（缺失 / 过期 / 多余 + FTS 完整性）、**后台重建进度条**、以及走同一套索引的「试搜」框
+- 🧮 状态接口：`GET /api/search/stats[?deep=1]`（deep 做磁盘校对 + FTS `integrity-check`）、`POST /api/search/reindex_async`（管理员，后台重建，立即返回，进度见 stats）
+- 🔍 知识库页（`/web/kb/{name}`）顶栏恢复**搜索栏**：300ms 去抖后检索**本知识库**工作区内容（走倒排索引），命中结果替换左侧文件树（带覆盖率、tooltip 显示命中摘要），清空即回到文件树；知识库总览页顶栏也给全局搜索入口
+- 🩹 引号查询兜底：`"精确短语"` 无结果时自动回退为整串模糊匹配，响应带 `fallback`，列表页提示「未找到精确短语，已显示模糊结果」
+
+### 内部改动
+- 相关性打分升级（不再只看短语+覆盖率）：`score = 3×短语命中 + 2×覆盖率 + 1×词频 + 1×近邻度 − 1.5×bm25`。词频按词块出现次数加权（封顶 5，避免长文堆词）；近邻度按各词块首现位置的跨度衰减（200 字符尺度，跨度越大越低，短语命中直接记满分）；bm25 权重从 0.2 提到 1.5（标题列权重 6 / 正文 1 真正参与排序）。API 命中项新增 `tf` / `proximity` / `bm25` 字段，索引页试搜一并展示
+- 后台重建与查询互不阻塞：重建期间 `refresh()` 直接跳过（读旧索引，搜索照常可用）
+- `stats()` 的 FTS 完整性检查后立即收尾事务，避免占住写锁挡住后台重建
+
+---
+
+## v2.7.1 (2026-09-16)
+
+### 问题修复
+- 🐛 修复公网部署机（`Lugwit_deploy=1`）网页端**所有人都登录不上**（`/note/login` 恒定 401「用户名或密码错误」）：`server_config.py` 的服务端默认 host 曾按机器类型切到公网入口（域名 `https://lugwit.duckdns.org` 或裸 IP `https://121.196.144.88`），而服务端调认证服务是**同机调用**——域名回环在部分网络下不通，裸 IP 入口是自签证书，`urllib` 默认校验证书直接 `SSL CERTIFICATE_VERIFY_FAILED`。现固定走本机 nginx 回环入口 `http://127.0.0.1:8080`（与开发机一致，`/api/v1/auth` → 1027）。客户端侧的默认地址在 `l_notepad_client/server_config.py`，不受影响
+- 🐛 认证服务不可用不再伪装成密码错误：`auth.login` 区分「认证服务不可用」（抛 `AuthUnavailable` 并记日志）与「用户名或密码错误」，登录接口回 503「认证服务不可用，请稍后重试或联系管理员」，不再让用户误以为是密码问题
+
+---
+
+## v2.7.0 (2026-09-16)
+
+### 新增功能
+- 🔍 搜索路由 `GET /api/search?q=&limit=&offset=&sources=`：FTS5 倒排索引检索（`search_fts` + `search_docs` 表，见 `search_index.py`），只查索引不读文档，返回命中摘要 / 覆盖率 / `open_url` / 总命中数（分页）；`sources=note,kb` 可过滤来源
+- 📚 索引源含**知识库工作区**：除个人笔记（`source=note`）外，各知识库 `workspace` 目录下的 `.md/.txt/.rst/.log` 也入索引（`source=kb`，登录可见）；列表页命中卡片带「📚 知识库」标签并直达 `?file=<rel>` 定位
+- 🎯 宽召回 + 相关性排序：中文按 bigram **OR** 召回（不再"精确无果才兜底"），排序按「命中短语 > bigram 覆盖率 > bm25 > 时间」；`"引号"` 包住的片段转 FTS5 短语要求精确命中（搜 `创建包` 能命中「创建 Rez 包」的文档，`"创建包"` 则只命中连写）
+- ⚡ 索引增量维护：本服务内增删改经 `file_store` 变更通知即时标脏、下次查询补索引；外部改动（桌面端落盘、托盘写入）由 TTL（5s）全量比对 `mtime/size` 兜底，内容未变的文件不重读
+- 🈶 中文检索：写入前按二元切分（bigram）再入倒排表（unicode61 不切汉字，整段汉字会变成一个 token）
+- 🔧 `POST /api/search/reindex`（管理员）：清空重建全部索引（含知识库工作区）
+- 🚀 列表页 `/web?q=` 改为走倒排索引（原实现每次请求逐篇读全文、单文件 2MB 上限），结果按相关度排序并展示命中摘要
+- 💻 知识库工作区支持**本机模式**：后端在远程机时 `/web/kb/{name}` 的工作区可改读**浏览器所在机器**的目录——页面探测本机托盘 `http://127.0.0.1:19527/health`（有 `kb_ws_list` 即启用），列/读/写/打开目录改走托盘白名单动作（`kb_ws_*`），首次需点「📂 选择本机目录」由用户授权（root 写入 `~/.Lugwit/l_tray/kb_ws_roots.json`）；托盘不在线时自动回退服务端工作区
+- 🔓 CSP `connect-src` 放行 `http://127.0.0.1:19527`（本机托盘 ExecServer），否则浏览器会拦掉本机模式请求
+
+### 内部改动
+- `file_store.set_note_change_hook` 单槽改为多订阅者（`add_note_change_hook` / `remove_note_change_hook`），`cloud_sync` 改用 add/remove（原先 `stop()` 会卸载搜索索引订阅）
+
+---
+
 ## v2.6.0 (2026-09-02)
 
 ### 新增功能

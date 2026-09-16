@@ -1,0 +1,463 @@
+{% extends "base.html" %}
+{% block title %}搜索索引 · L Notepad{% endblock %}
+{% block page_id %}search-index{% endblock %}
+{% block page_style %}
+      .wrap { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }
+      .panel {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+        padding: 16px 18px; margin-bottom: 16px;
+      }
+      .panel h3 { margin: 0 0 12px; font-size: 14px; color: var(--text); }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+      .kpi {
+        background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 11px;
+        padding: 10px 12px;
+      }
+      .kpi .k { font-size: 11px; color: var(--muted); }
+      .kpi .v { font-size: 20px; font-weight: 600; color: var(--accent-bright); margin-top: 2px; }
+      .kpi .s { font-size: 11px; color: var(--faint); margin-top: 2px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      th { color: var(--muted); font-weight: 500; font-size: 11px; }
+      td.mono, th.mono { font-family: Consolas, Menlo, monospace; font-size: 11px; word-break: break-all; }
+      .pill {
+        display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10px;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .pill.ok { color: #6ee7a8; border-color: rgba(110,231,168,0.38); }
+      .pill.warn { color: #fbbf24; border-color: rgba(251,191,36,0.38); }
+      .pill.bad { color: #f87171; border-color: rgba(248,113,113,0.38); }
+      .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .bar { height: 10px; border-radius: 6px; background: rgba(255,255,255,0.05); overflow: hidden; margin-top: 8px; }
+      .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-bright)); }
+      .muted { color: var(--muted); font-size: 11px; }
+      .mono { font-family: Consolas, Menlo, monospace; }
+      input.q {
+        flex: 1; min-width: 200px; background: rgba(8,12,26,0.80); border: 1px solid var(--border);
+        border-radius: 8px; color: var(--text); font-size: 12px; padding: 7px 10px; outline: none;
+      }
+      input.q:focus { border-color: var(--accent-border); }
+      #hits { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+      .hit {
+        border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px;
+        background: rgba(255,255,255,0.02); font-size: 12px;
+      }
+      .hit.hot { border-color: rgba(110,231,168,0.35); background: rgba(110,231,168,0.05); }
+      .hit-head { display: flex; align-items: center; gap: 8px; }
+      .hit-head a { color: var(--accent-bright); text-decoration: none; font-weight: 600; }
+      .badge-score {
+        margin-left: auto; flex-shrink: 0;
+        padding: 2px 10px; border-radius: 20px; font-weight: 700; font-size: 13px;
+        color: #0b1120; background: linear-gradient(180deg, #7cfc9a, #35c97a);
+      }
+      .hit .snip { color: var(--muted); margin-top: 5px; line-height: 1.55; }
+      .signals { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 7px; }
+      .sig {
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 2px 9px; border-radius: 20px; font-size: 11px; color: var(--muted);
+        border: 1px solid var(--border); background: rgba(255,255,255,0.03);
+      }
+      .sig b { color: var(--accent-bright); font-size: 12px; }
+      .sig.main { border-color: var(--accent-border); }
+      .sig.hot-sig { border-color: rgba(110,231,168,0.5); color: #9df0bd; }
+      .sig.dim { opacity: 0.55; }
+      .sig .mini {
+        display: block; width: 42px; height: 6px; border-radius: 4px;
+        background: rgba(255,255,255,0.10); overflow: hidden;
+      }
+      .sig .mini s { display: block; height: 100%; width: 0; text-decoration: none; }
+      .sig .mini.cov s { background: linear-gradient(90deg, #5b9cff, #7cfc9a); }
+      .sig .mini.prox s { background: linear-gradient(90deg, #fbbf24, #7cfc9a); }
+      .sig.when { font-family: Consolas, Menlo, monospace; }
+{% endblock %}
+{% block appbar_sub %}搜索索引状态与进度{% endblock %}
+{% block appbar_actions %}
+          <button class="btn sm" type="button" id="btn-refresh">刷新</button>
+          <button class="btn sm" type="button" id="btn-deep">磁盘校对</button>
+{% endblock %}
+{% block body %}
+    <div class="wrap">
+      <div class="panel">
+        <h3>索引总览</h3>
+        <div class="cards" id="kpis"></div>
+        <div class="row-actions" style="margin-top:12px;">
+          <button class="btn sm primary" type="button" id="btn-rebuild" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>重建索引</button>
+          <span class="muted" id="rebuild-hint">
+            {% if is_admin %}重建会清空并重扫全部来源，进度实时显示{% else %}重建需要管理员权限，当前只读{% endif %}
+          </span>
+        </div>
+        <div id="progress-wrap" style="display:none;">
+          <div class="bar"><i id="progress-bar"></i></div>
+          <div class="muted" id="progress-text" style="margin-top:6px;"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>索引来源</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>来源</th><th>根目录</th><th>文档数</th><th>数据量</th>
+              <th>最后索引</th><th id="th-verify" style="display:none;">磁盘校对</th>
+            </tr>
+          </thead>
+          <tbody id="src-rows"></tbody>
+        </table>
+        <div class="muted" style="margin-top:8px;" id="src-note"></div>
+      </div>
+
+      <div class="panel">
+        <h3>语义检索（向量）</h3>
+        <div class="row-actions" style="margin-bottom:10px;">
+          <span class="muted">embedding 模型</span>
+          <select class="q" id="vec-model" style="flex:0 0 auto; width:330px;"></select>
+          <span class="muted" id="vec-model-info"></span>
+        </div>
+        <div class="cards" id="vec-kpis"></div>
+        <div class="row-actions" style="margin-top:12px;">
+          <button class="btn sm primary" type="button" id="btn-embed" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>嵌入新增/变更文档</button>
+          <button class="btn sm" type="button" id="btn-embed-force" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>全量重嵌</button>
+          <span class="muted" id="vec-hint"></span>
+        </div>
+        <div id="embed-wrap" style="display:none;">
+          <div class="bar"><i id="embed-bar"></i></div>
+          <div class="muted" id="embed-text" style="margin-top:6px;"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>试搜（走同一套倒排索引）</h3>
+        <div class="row-actions">
+          <input class="q" id="q" placeholder="输入关键词，回车搜索…（&quot;引号&quot; 表示精确短语）" />
+          <select class="q" id="mode" style="flex:0 0 auto; width:120px;">
+            <option value="hybrid">混合</option>
+            <option value="lex">仅词法</option>
+            <option value="sem">仅语义</option>
+          </select>
+          <button class="btn sm" type="button" id="btn-search">搜索</button>
+          <span class="muted" id="search-info"></span>
+        </div>
+        <div id="hits"></div>
+      </div>
+    </div>
+{% endblock %}
+{% block page_script %}
+    <script>
+      (function () {
+        const root = "{{ root_base }}";
+        const fmtBytes = function (n) {
+          n = n || 0;
+          if (n < 1024) return n + " B";
+          if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+          if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+          return (n / 1073741824).toFixed(2) + " GB";
+        };
+        const esc = function (s) {
+          return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+          });
+        };
+
+        let deep = false;
+        let timer = null;
+        let catalogCache = [];
+
+        function kpi(k, v, s, cls) {
+          return '<div class="kpi"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) +
+            '</div>' + (s ? '<div class="s">' + esc(s) + "</div>" : "") + "</div>";
+        }
+
+        function renderKpis(d) {
+          const srcDocs = (d.sources || []).reduce(function (a, s) { return a + (s.docs || 0); }, 0);
+          const kbDocs = (d.sources || []).filter(function (s) { return s.source === "kb"; })
+            .reduce(function (a, s) { return a + (s.docs || 0); }, 0);
+          const noteDocs = srcDocs - kbDocs;
+          let html = "";
+          html += kpi("索引文档", d.docs, "笔记 " + noteDocs + " · 知识库 " + kbDocs);
+          html += kpi("倒排行数", d.fts_rows, d.fts_consistent ? "与文档表一致" : "与文档表不一致！");
+          html += kpi("索引体积", fmtBytes(d.db_bytes), "含 FTS5 倒排与原文");
+          html += kpi("待处理队列", d.pending, "服务内变更待补索引");
+          html += kpi("扫描间隔", d.scan_ttl_s + "s",
+            d.last_scan_ago == null ? "本进程尚未扫描" : "上次扫描 " + d.last_scan_ago + "s 前");
+          html += kpi("单文件上限", fmtBytes(d.max_index_bytes), "超出部分不参与检索");
+          if (d.deep) {
+            const miss = (d.sources || []).reduce(function (a, s) { return a + (s.missing || 0); }, 0);
+            const chg = (d.sources || []).reduce(function (a, s) { return a + (s.changed || 0); }, 0);
+            const extra = (d.sources || []).reduce(function (a, s) { return a + (s.extra || 0); }, 0);
+            html += kpi("磁盘校对", miss + " 缺失 / " + chg + " 过期 / " + extra + " 多余",
+              "完整性：" + (d.fts_integrity || "?"));
+          }
+          document.getElementById("kpis").innerHTML = html;
+        }
+
+        function renderSources(d) {
+          const rows = (d.sources || []).map(function (s) {
+            const verified = d.deep && s.disk_files != null
+              ? '<span class="pill ' + ((s.missing || s.changed || s.extra) ? "warn" : "ok") + '">磁盘 ' +
+                s.disk_files + " · 缺 " + (s.missing || 0) + " · 过期 " + (s.changed || 0) +
+                " · 多余 " + (s.extra || 0) + "</span>"
+              : "";
+            return "<tr><td>" + (s.source === "kb" ? "📚 知识库 <b>" + esc(s.kb_name) + "</b>" : "📝 个人笔记") +
+              '</td><td class="mono">' + esc(s.root) +
+              (s.exists ? "" : ' <span class="pill bad">目录不存在</span>') + "</td><td>" + s.docs +
+              "</td><td>" + fmtBytes(s.bytes) + "</td><td>" + esc(s.last_indexed_at || "—") +
+              (s.newest_mtime ? '<div class="muted">最新内容 ' + esc(s.newest_mtime) + "</div>" : "") +
+              "</td>" + (d.deep ? "<td>" + verified + "</td>" : "") + "</tr>";
+          }).join("");
+          document.getElementById("src-rows").innerHTML =
+            rows || '<tr><td colspan="6" class="muted">尚无索引内容</td></tr>';
+          document.getElementById("th-verify").style.display = d.deep ? "" : "none";
+          document.getElementById("src-note").textContent =
+            "索引源 = 笔记目录 + 各知识库工作区（" + (d.workspace_exts || []).join(" / ") + "）；" +
+            "内容未变的文件不会重读。";
+        }
+
+        function renderProgress(d) {
+          const r = d.reindex || {};
+          const wrap = document.getElementById("progress-wrap");
+          if (!r.running && !r.finished_at) { wrap.style.display = "none"; return; }
+          wrap.style.display = "";
+          const total = r.total || 0;
+          const done = Math.min(r.done || 0, total || (r.done || 0));
+          const pct = total ? Math.round((done / total) * 100) : (r.running ? 0 : 100);
+          document.getElementById("progress-bar").style.width = pct + "%";
+          let txt = r.running
+            ? (r.phase === "counting"
+                ? "正在统计文件数…"
+                : "重建中 " + done + " / " + (total || "?") + " 个文件（" + pct + "%）")
+            : "上次重建完成：写入/删除 " + (r.updated || 0) + " 行";
+          if (r.started_at) txt += " · 开始 " + r.started_at;
+          if (r.finished_at) txt += " · 结束 " + r.finished_at;
+          if (r.error) txt += " · 出错：" + r.error;
+          document.getElementById("progress-text").textContent = txt;
+        }
+
+        function renderVecModel(d) {
+          const v = (d.vec || {}).catalog ? d.vec : null;
+          const sel = document.getElementById("vec-model");
+          const info = document.getElementById("vec-model-info");
+          if (!v) { sel.innerHTML = ""; info.textContent = ""; return; }
+          catalogCache = v.catalog || [];
+          const cur = (d.vec.model || "").trim();
+          sel.innerHTML = (v.catalog || []).map(function (m) {
+            return '<option value="' + esc(m.name) + '"' + (m.name === cur ? " selected" : "") + ">" +
+              (m.installed ? "✓ " : "⬇ ") + esc(m.label) + " · " + m.dim + "维 · " + m.size_mb + "MB" + "</option>";
+          }).join("");
+          const now = (v.catalog || []).filter(function (m) { return m.name === cur; })[0];
+          info.textContent = now ? (now.installed ? now.langs + " · " + now.note : "未安装，切换时需下载") : "";
+          const dl = v.download || {};
+          const wrap = document.getElementById("embed-wrap");
+          if (dl.running) {
+            wrap.style.display = "";
+            const pct = dl.total ? Math.round((dl.completed / dl.total) * 100) : 0;
+            document.getElementById("embed-bar").style.width = pct + "%";
+            document.getElementById("embed-text").textContent =
+              "下载模型 " + dl.model + "：" + (dl.status || "") + " " + pct + "%（" +
+              fmtBytes(dl.completed) + " / " + fmtBytes(dl.total) + "）";
+          }
+        }
+
+        function switchModel(name, needDownload) {
+          if (needDownload) {
+            const m = (catalogCache || []).filter(function (x) { return x.name === name; })[0] || {};
+            const ok = confirm("模型「" + (m.label || name) + "」尚未安装，需要下载约 " +
+              (m.size_mb || "?") + " MB。\n\n【确定】开始下载并切换（下载完需重新嵌入）\n【取消】保持当前模型，不下载");
+            if (!ok) { load(); return; }
+            fetch(root + "/api/search/model/download", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ model: name })
+            }).then(function (r) { return r.json(); }).then(function () { load(); })
+              .catch(function (e) { alert("下载失败：" + e.message); });
+            return;
+          }
+          fetch(root + "/api/search/model", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: name })
+          }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+            .then(function (res) {
+              if (!res.ok) throw new Error((res.j && res.j.detail) || "HTTP 失败");
+              if (res.j && res.j.need_download) { switchModel(name, true); return; }
+              alert("已切换到 " + name + "。\n向量与模型不匹配，请点「全量重嵌」重建向量索引。");
+              load();
+            })
+            .catch(function (e) { alert("切换失败：" + e.message); });
+        }
+        document.getElementById("vec-model").addEventListener("change", function () {
+          const name = this.value;
+          const m = (catalogCache || []).filter(function (x) { return x.name === name; })[0];
+          switchModel(name, !(m && m.installed));
+        });
+
+        function renderVec(d) {
+          const v = d.vec || {};
+          const avail = v.available || {};
+          const on = !!avail.available;
+          let html = "";
+          html += kpi("语义检索", on ? "已就绪" : "不可用", on ? (v.model || "") : (avail.reason || ""));
+          html += kpi("已嵌文档", v.docs || 0, "块 " + (v.chunks || 0) + " · 维度 " + (v.dim || 0));
+          html += kpi("最近嵌入", v.last_embedded_at || "—", "块大小 " + (v.chunk_size || 0) + " 字符 / 批 " + (v.batch || 0));
+          document.getElementById("vec-kpis").innerHTML = html;
+          document.getElementById("vec-hint").textContent = on
+            ? "embedding 服务：" + (v.url || "") + " · 改文件后需重新嵌入（词法索引不依赖它）"
+            : (avail.reason || "未配置本机 embedding 服务");
+
+          const st = v.embed || {};
+          const dl = v.download || {};
+          const wrap = document.getElementById("embed-wrap");
+          if (dl.running) return;  // 下载中，进度条交给下载显示
+          if (!st.running && !st.finished_at) { wrap.style.display = "none"; return; }
+          wrap.style.display = "";
+          const total = st.total || 0, done = st.done || 0;
+          const pct = total ? Math.round((done / total) * 100) : (st.running ? 0 : 100);
+          document.getElementById("embed-bar").style.width = pct + "%";
+          let txt = st.running
+            ? (st.phase === "probing" ? "正在探测模型…" : "嵌入中 " + st.docs + " / " + total + " 篇（块 " + done + "，" + pct + "%）")
+            : "上次嵌入完成：" + (st.docs || 0) + " 篇";
+          if (st.started_at) txt += " · 开始 " + st.started_at;
+          if (st.finished_at) txt += " · 结束 " + st.finished_at;
+          if (st.error) txt += " · 出错：" + st.error;
+          document.getElementById("embed-text").textContent = txt;
+        }
+
+        function load() {
+          return fetch(root + "/api/search/stats?deep=" + (deep ? 1 : 0), { cache: "no-store" })
+            .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+            .then(function (d) {
+              renderKpis(d);
+              renderSources(d);
+              renderVecModel(d);
+              renderVec(d);
+              renderProgress(d);
+              if (d.reindex && d.reindex.running) schedule();
+              if (d.vec && d.vec.embed && d.vec.embed.running) schedule();
+              if (d.vec && d.vec.download && d.vec.download.running) schedule();
+              return d;
+            })
+            .catch(function (e) {
+              document.getElementById("src-rows").innerHTML =
+                '<tr><td colspan="6" class="pill bad">加载失败：' + esc(e.message) + "</td></tr>";
+            });
+        }
+
+        function schedule() {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(load, 1000);
+        }
+
+        document.getElementById("btn-refresh").addEventListener("click", function () { load(); });
+        document.getElementById("btn-deep").addEventListener("click", function () { deep = !deep; load(); });
+        document.getElementById("btn-rebuild").addEventListener("click", function () {
+          if (!confirm("重建索引：清空并重扫全部来源，期间搜索仍可用（读旧索引）。继续？")) return;
+          fetch(root + "/api/search/reindex_async", { method: "POST" })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+            .then(function (res) {
+              if (!res.ok) throw new Error((res.j && res.j.detail) || "HTTP 失败");
+              load();
+            })
+            .catch(function (e) { alert("重建失败：" + e.message); });
+        });
+
+        const embedBtn = function (force) {
+          const url = root + "/api/search/embed_async" + (force ? "?force=1" : "");
+          fetch(url, { method: "POST" })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+            .then(function (res) {
+              if (!res.ok) throw new Error((res.j && res.j.detail) || "HTTP 失败");
+              if (res.j && res.j.available && res.j.available.available === false) {
+                alert("语义检索不可用：" + (res.j.available.reason || ""));
+              }
+              load();
+            })
+            .catch(function (e) { alert("启动嵌入失败：" + e.message); });
+        };
+        document.getElementById("btn-embed").addEventListener("click", function () { embedBtn(false); });
+        document.getElementById("btn-embed-force").addEventListener("click", function () {
+          if (!confirm("全量重新嵌入所有文档？耗时较长（每个块都要过一遍 embedding）。继续？")) return;
+          embedBtn(true);
+        });
+
+        function doSearch() {
+          const q = document.getElementById("q").value.trim();
+          const box = document.getElementById("hits");
+          if (!q) { box.innerHTML = ""; document.getElementById("search-info").textContent = ""; return; }
+          const mode = (document.getElementById("mode") || {}).value || "hybrid";
+          fetch(root + "/api/search?q=" + encodeURIComponent(q) + "&limit=20&mode=" + mode, { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              const v = d.vec || {};
+              document.getElementById("search-info").textContent =
+                "命中 " + d.total + " 条 · " + d.took_ms + "ms" + (d.fallback ? " · 精确短语无结果，已模糊匹配" : "") +
+                (v.used ? " · 语义命中 " + v.hits + "（" + (v.model || "") + "）" : "");
+              box.innerHTML = (d.hits || []).map(function (h) {
+                const num = function (v, d) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(d); };
+                const pct = function (v) { return (v === null || v === undefined) ? 0 : Math.round(v * 100); };
+                const sig = function (label, value, tip, extra) {
+                  return '<span class="sig' + (extra || "") + '" title="' + esc(tip || "") + '">' +
+                    label + " <b>" + value + "</b></span>";
+                };
+                const bar = function (v, cls) {
+                  return '<i class="mini' + (cls || "") + '"><s style="width:' + pct(v) + '%"></s></i>';
+                };
+                // 命中词高亮：先转义，再按位置区间套 <mark>（相邻/重叠合并）
+                const hl = function (text, terms) {
+                  const safe = esc(text);
+                  const low = safe.toLowerCase();
+                  const spans = [];
+                  (terms || []).slice().sort(function (a, b) { return b.length - a.length; })
+                    .forEach(function (t) {
+                      const needle = esc(t).toLowerCase();
+                      if (!needle) return;
+                      let from = 0;
+                      while (spans.length < 200) {
+                        const p = low.indexOf(needle, from);
+                        if (p < 0) break;
+                        spans.push([p, p + needle.length]);
+                        from = p + 1;
+                      }
+                    });
+                  if (!spans.length) return safe;
+                  spans.sort(function (a, b) { return a[0] - b[0]; });
+                  const merged = [];
+                  spans.forEach(function (s) {
+                    const last = merged[merged.length - 1];
+                    if (last && s[0] <= last[1]) last[1] = Math.max(last[1], s[1]);
+                    else merged.push([s[0], s[1]]);
+                  });
+                  let out = "", at = 0;
+                  merged.forEach(function (s) {
+                    out += safe.slice(at, s[0]) + "<mark>" + safe.slice(s[0], s[1]) + "</mark>";
+                    at = s[1];
+                  });
+                  return out + safe.slice(at);
+                };
+                const hot = (h.phrase_hits || 0) > 0;
+                return '<div class="hit' + (hot ? " hot" : "") + '">' +
+                  '<div class="hit-head"><a href="' + esc(h.open_url) + '">' +
+                  (h.source === "kb" ? "📚 " : "📝 ") + esc(h.rel) + "</a>" +
+                  '<span class="badge-score" title="综合相关度：3×短语 + 2×覆盖率 + 词频 + 近邻 − 1.5×bm25">' +
+                  num(h.score, 2) + "</span></div>" +
+                  '<div class="snip">' + hl(h.snippet, h.matches) + "</div>" +
+                  '<div class="signals">' +
+                  (hot ? '<span class="sig hot-sig" title="引号短语精确命中次数">短语 <b>' + h.phrase_hits + "</b></span>" : "") +
+                  '<span class="sig main" title="查询词块有多少出现在本文（越高越好）">覆盖 <b>' + pct(h.coverage) + "%</b>" +
+                  bar(h.coverage, " cov") + "</span>" +
+                  '<span class="sig main" title="命中词块相近程度：1.0 最集中（200 字符内）">近邻 <b>' + num(h.proximity, 2) + "</b>" +
+                  bar(h.proximity, " prox") + "</span>" +
+                  (h.vec ? '<span class="sig main" title="向量语义相似度（余弦）">语义 <b>' + num(h.vec, 3) + "</b></span>" : "") +
+                  sig("词频", num(h.tf, 2), "词块出现次数加权（单块封顶 5 次）", " dim") +
+                  sig("bm25", num(h.bm25, 2), "倒排引擎原始分（越负越相关，取负后计入总分）", " dim") +
+                  '<span class="sig dim when">' + esc((h.updated_at || "").replace("T", " ").slice(0, 16)) + "</span>" +
+                  "</div></div>";
+              }).join("") || '<div class="muted">无命中</div>';
+            })
+            .catch(function (e) { box.innerHTML = '<div class="pill bad">搜索失败：' + esc(e.message) + "</div>"; });
+        }
+        document.getElementById("btn-search").addEventListener("click", doSearch);
+        document.getElementById("q").addEventListener("keydown", function (e) {
+          if (e.key === "Enter") { e.preventDefault(); doSearch(); }
+        });
+
+        load();
+      })();
+    </script>
+{% endblock %}

@@ -1068,9 +1068,9 @@
     <div id="toast" role="status" aria-live="polite"></div>
 {% endblock %}
 {% block page_script %}
-    <script src="{{ _mounted_url(request, 'static/purify.min.js') }}"></script>
-    <script src="{{ _mounted_url(request, 'static/marked.umd.min.js') }}"></script>
-    <script src="{{ _mounted_url(request, 'static/mm.js') }}"></script>
+    <script src="{{ static_url(request, 'purify.min.js') }}"></script>
+    <script src="{{ static_url(request, 'marked.umd.min.js') }}"></script>
+    <script src="{{ static_url(request, 'mm.js') }}"></script>
     <script>
       (function () {
         const webBase       = "{{ web_base }}";

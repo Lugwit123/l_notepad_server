@@ -588,7 +588,7 @@
 {% block appbar_actions %}
           <form class="search" method="get" action="{{ web_base }}" role="search" aria-label="搜索笔记">
             <span class="search-icon">🔍</span>
-            <input name="q" value="{{ q }}" placeholder="搜索标题或内容…" aria-label="搜索" title="输入时即时按标题过滤；按回车进行标题+正文全文检索" />
+            <input name="q" value="{{ q }}" placeholder="搜索标题或内容…" aria-label="搜索" title="输入时即时按标题过滤；按回车进行标题+正文全文检索（服务端倒排索引）" />
           </form>
           <a class="btn primary" href="{{ web_base }}/new">新建</a>
 {% endblock %}
@@ -644,7 +644,7 @@
               <div class="note-nav">
                 {% for n in notes %}
                 {% set is_md = n.title.endswith('.md') or n.title.endswith('.mdc') %}
-                <a class="nav-item {% if active_note_path == n.path %}active{% endif %} {% if is_md %}md-nav{% endif %}" href="{{ web_base }}/{{ n.path }}"
+                <a class="nav-item {% if active_note_path == n.path %}active{% endif %} {% if is_md %}md-nav{% endif %}" href="{{ n.url if n.url else web_base ~ '/' ~ n.path }}"
                    data-title="{{ n.title }}"
                    data-group="{{ n.path.rsplit('/', 1)[0] if '/' in n.path else '' }}"
                    data-owner="{{ owner_map.get(n.path, '') }}"
@@ -652,12 +652,13 @@
                    data-tags="{{ tags_map.get(n.path, []) | join('|') }}">
                   <div class="nav-top">
                     <span class="badge">{{ n.path }}</span>
+                    {% if n.source == 'kb' %}<span class="type-tag kb" title="知识库工作区文件">📚</span>{% endif %}
                     {% if n.path not in owned_paths %}<span class="shared-dot" title="共享给我的笔记">🔗</span>{% endif %}
                     <span class="nav-dot"></span>
                     <span class="time" data-ts="{{ n.updated_at }}">{{ n.updated_at }}</span>
                   </div>
                   <div class="nav-title">{{ n.title }} <span class="nav-owner">👤 {{ owner_map.get(n.path, '') }}</span></div>
-                  <div class="nav-snippet">{{ n.content[:120].replace('\n',' ') }}</div>
+                  <div class="nav-snippet">{{ (n.content_html if n.content_html else (n.content[:120].replace('\n',' ') | e)) | safe }}</div>
                 </a>
                 {% endfor %}
               </div>
@@ -669,11 +670,12 @@
           <div class="content-header">
             <div class="content-header-left">
               <h2>日志内容预览</h2>
-              <p>点击卡片进入编辑；左侧列表可快速定位；搜索框支持标题与正文全文检索（服务端全文匹配）。</p>
+              <p>点击卡片进入编辑；左侧列表可快速定位；搜索框支持标题与正文全文检索（服务端倒排索引，命中段落摘要），结果按相关度排序。</p>
             </div>
             <div class="content-header-right">
               <span class="stat-chip">共 <strong>{{ notes|length }}</strong> 条</span>
               {% if q %}<span class="stat-chip active">筛选：<strong>{{ q }}</strong></span>{% endif %}
+              {% if fallback %}<span class="stat-chip" title="引号表示精确短语；未找到精确匹配时自动回退为模糊搜索">未找到精确短语，已显示模糊结果</span>{% endif %}
               <a class="btn primary" href="{{ web_base }}/new">新建</a>
             </div>
           </div>
@@ -682,7 +684,7 @@
             {% for n in notes %}
             {% set is_md = n.title.endswith('.md') or n.title.endswith('.mdc') %}
             {% set is_mmd = n.title.endswith('.mmd') %}
-            <a class="card {% if is_md %}md-card{% endif %}" href="{{ web_base }}/{{ n.path }}"
+            <a class="card {% if is_md %}md-card{% endif %}" href="{{ n.url if n.url else web_base ~ '/' ~ n.path }}"
                data-title="{{ n.title }}"
                data-group="{{ n.path.rsplit('/', 1)[0] if '/' in n.path else '' }}"
                data-owner="{{ owner_map.get(n.path, '') }}"
@@ -691,7 +693,9 @@
               <div class="row">
                 <div class="name">
                   <span class="badge">{{ n.path }}</span>{{ n.title }}
-                  {% if n.path not in owned_paths %}
+                  {% if n.source == 'kb' %}
+                  <span class="type-tag kb" title="知识库工作区文件（{{ n.kb_name }}）">📚 知识库</span>
+                  {% elif n.path not in owned_paths %}
                   <span class="type-tag shared" title="共享给我的笔记">🔗 共享</span>
                   {% endif %}
                 </div>
@@ -703,7 +707,7 @@
                   <span class="type-tag txt">TXT</span>
                 {% endif %}
               </div>
-              <div class="snippet">{{ n.content[:220].replace('\n',' ') }}</div>
+              <div class="snippet">{{ (n.content_html if n.content_html else (n.content[:220].replace('\n',' ') | e)) | safe }}</div>
               {% if tags_map.get(n.path) %}
               <div class="card-tags">
                 {% for t in tags_map.get(n.path, []) %}<span class="tag-mini">🏷 {{ t }}</span>{% endfor %}
@@ -745,6 +749,9 @@
 
         // ── 组合过滤：搜索 + 分组 + 标签 + 创建者 ──────────────
         var searchInput = document.querySelector(".search input");
+        // 服务端 ?q= 已经过滤过（含正文命中与知识库工作区文件），不能再用它做本地标题过滤，
+        // 否则正文命中/工作区条目会被隐藏；用户再次输入不同关键词时才启用即时标题过滤。
+        var serverQ = "{{ q|e }}";
         var cards       = Array.prototype.slice.call(document.querySelectorAll("#note-grid .card"));
         var navItems    = Array.prototype.slice.call(document.querySelectorAll(".note-nav .nav-item"));
         var emptyState  = document.getElementById("empty-state");
@@ -867,9 +874,12 @@
           searchInput.addEventListener("input", function () {
             if (filterTimer) clearTimeout(filterTimer);
             var v = this.value;
-            filterTimer = setTimeout(function () { state.kw = v.trim().toLowerCase(); applyFilters(); }, 120);
+            filterTimer = setTimeout(function () {
+              var t = v.trim();
+              state.kw = (t === serverQ) ? "" : t.toLowerCase();
+              applyFilters();
+            }, 120);
           });
-          if (searchInput.value) { state.kw = searchInput.value.trim().toLowerCase(); applyFilters(); }
         }
       })();
     </script>

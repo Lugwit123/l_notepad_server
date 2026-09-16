@@ -595,7 +595,7 @@ def start(notes_root: Path, db_path: Path) -> bool:
         return False
     _enabled = True
 
-    file_store.set_note_change_hook(_on_note_change)  # type: ignore[arg-type]
+    file_store.add_note_change_hook(_on_note_change)  # type: ignore[arg-type]
 
     worker = threading.Thread(target=_push_worker, name="cloud_sync_push", daemon=True)
     puller = threading.Thread(target=_pull_loop, name="cloud_sync_pull", daemon=True)
@@ -613,7 +613,7 @@ def start(notes_root: Path, db_path: Path) -> bool:
 def stop() -> None:
     global _enabled
     _enabled = False
-    file_store.set_note_change_hook(None)
+    file_store.remove_note_change_hook(_on_note_change)  # type: ignore[arg-type]
     _pull_stop.set()
 
 

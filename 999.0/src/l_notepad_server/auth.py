@@ -39,16 +39,32 @@ def _http_json(method: str, path: str, body: Any = None, token: str = "", timeou
         return json.loads(raw) if raw else None
 
 
+class AuthUnavailable(RuntimeError):
+    """认证服务不可用（连不上 / 超时 / 证书校验失败 / 非 401 响应）。
+
+    必须与「用户名或密码错误」区分：调用方据此回 503 而不是 401
+    —— 否则地址配错、服务没起来都会伪装成密码错误（登录全挂且无从排查）。
+    """
+
+
 async def login(username: str, plain_password: str) -> Optional[dict]:
-    """通过 Auth Service 登录，成功返回 {access_token, user}，失败返回 None"""
+    """通过 Auth Service 登录，成功返回 {access_token, user}。
+
+    密码/用户错误返回 None；认证服务不可用抛 AuthUnavailable。
+    """
     try:
         return await asyncio.to_thread(
             _http_json, "POST", "/api/v1/auth/login",
             {"username": username, "password": plain_password},
         )
-    except Exception:
-        # Auth Service 不可用等异常统一视为登录失败，避免泄漏内部信息
-        return None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return None
+        lprint(f"[l_notepad][login] Auth 服务返回 HTTP {exc.code}")
+        raise AuthUnavailable(f"Auth 服务返回 HTTP {exc.code}") from exc
+    except Exception as exc:
+        lprint(f"[l_notepad][login] Auth 服务不可用: {exc!r}")
+        raise AuthUnavailable("认证服务不可用") from exc
 
 
 def list_users(token: str) -> list[dict]:
@@ -86,4 +102,4 @@ def role_int_to_label(role_int: Any) -> str:
     return {0: "用户", 1: "管理员", 2: "系统"}.get(role_int, "")
 
 
-__all__ = ["login", "list_users", "verify_token", "role_int_to_label"]
+__all__ = ["AuthUnavailable", "login", "list_users", "verify_token", "role_int_to_label"]

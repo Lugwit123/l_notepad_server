@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -14,6 +16,7 @@ from pydantic import BaseModel
 from .. import auth as authmod
 from .. import file_store
 from .. import note_access
+from .. import search_index
 from .deps import (
     accessible_brief,
     current_user,
@@ -22,12 +25,10 @@ from .deps import (
     is_admin,
     mounted_url,
     template_ctx,
+    web_base,
 )
 
 router = APIRouter(tags=["web"])
-
-# 全文搜索时单文件读取上限
-_SEARCH_MAX_BYTES = 2 * 1024 * 1024
 
 _TAG_SPLIT = re.compile(r"[,，;；]+")
 
@@ -61,6 +62,50 @@ def _groups_from_notes(notes: list[file_store.FileNote]) -> list[tuple[str, int]
     return sorted(groups.items())
 
 
+@dataclass(frozen=True)
+class SearchHitView:
+    """搜索结果条目视图：字段与 FileNote 对齐（模板复用），额外带来源与打开地址。"""
+
+    path: str
+    title: str
+    content: str
+    created_at: str
+    updated_at: str
+    url: str
+    content_html: str = ""   # 命中词已 <mark> 的摘要（模板用 |safe）
+    score: float = 0.0
+    coverage: float = 0.0
+    source: str = "note"
+    kb_name: str = ""
+
+
+def _hit_view(request: Request, hit: dict[str, Any], brief: list[file_store.FileNote]) -> SearchHitView:
+    """搜索结果 → 模板条目：笔记指向编辑页，知识库工作区指向知识库页并定位文件。"""
+    rel = str(hit.get("rel") or hit.get("path") or "")
+    if hit.get("source") == "kb":
+        url = f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={quote(rel, safe='/')}"
+        prefix = f"{hit.get('kb_name') or ''} / "
+    else:
+        url = f"{web_base(request)}/{quote(rel, safe='/')}"
+        prefix = ""
+    brief_map = {n.path: n for n in brief}
+    base = brief_map.get(str(hit.get("path") or ""))
+    snippet = str(hit.get("snippet") or "")
+    return SearchHitView(
+        path=str(hit.get("path") or rel),
+        title=prefix + rel,
+        content=snippet,
+        content_html=search_index.highlight(snippet, list(hit.get("matches") or [])),
+        score=float(hit.get("score") or 0.0),
+        coverage=float(hit.get("coverage") or 0.0),
+        created_at=base.created_at if base else str(hit.get("updated_at") or ""),
+        updated_at=str(hit.get("updated_at") or ""),
+        url=url,
+        source=str(hit.get("source") or "note"),
+        kb_name=str(hit.get("kb_name") or ""),
+    )
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -71,7 +116,11 @@ class LoginRequest(BaseModel):
 
 @router.post("/api/auth/login")
 async def auth_login(payload: LoginRequest, response: Response) -> dict[str, Any]:
-    data = await authmod.login(payload.username, payload.password)
+    try:
+        data = await authmod.login(payload.username, payload.password)
+    except authmod.AuthUnavailable:
+        # 认证服务连不上/超时/证书校验失败：不能说成"密码错误"，否则用户只能反复试密码
+        raise HTTPException(status_code=503, detail="认证服务不可用，请稍后重试或联系管理员")
     if not data:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     response.set_cookie(
@@ -120,6 +169,15 @@ def web_logs_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request, "web_logs.html", {**template_ctx(request)})
 
 
+# ── 搜索索引状态页 ── 注意：同样必须在 /web/{note_path:path} 之前注册
+
+
+@router.get("/web/index", response_class=HTMLResponse)
+def web_index_page(request: Request) -> HTMLResponse:
+    templates = get_templates(request)
+    return templates.TemplateResponse(request, "web_index.html", {**template_ctx(request)})
+
+
 # ── 笔记列表 / 新建 / 编辑 ──
 
 
@@ -139,27 +197,28 @@ def web_list(
     owner_map = note_access.owner_map(conn)
     creators = sorted({owner_map[n.path] for n in notes if owner_map.get(n.path)})
     groups = _groups_from_notes(notes)
-    query = (q or "").strip().lower()
+    query = (q or "").strip()
+    fallback = False
     if query:
-        # 服务端全文搜索：摘要（8KB 头）匹配不到时回源读全文（单文件上限 2MB）
-        matched: list[file_store.FileNote] = []
-        for n in notes:
-            if query in n.title.lower() or query in n.content.lower():
-                matched.append(n)
-                continue
-            p = Path(request.app.state.notes_root) / n.path
-            try:
-                if query in file_store.read_text_capped(p, _SEARCH_MAX_BYTES).lower():
-                    matched.append(n)
-            except OSError:
-                continue
-        notes = matched
+        # 走 FTS5 倒排索引检索（毫秒级），不再逐文件读全文；命中行按相关度排序。
+        # 同时含个人笔记与知识库工作区命中，各自给出可打开的 url
+        result = search_index.search(
+            conn,
+            request.app.state.notes_root,
+            query,
+            user=current_user(request),
+            admin=is_admin(request),
+            limit=500,
+        )
+        notes = [_hit_view(request, h, notes) for h in result["hits"]]
+        fallback = bool(result.get("fallback"))
     return templates.TemplateResponse(
         request,
         "web_list.html",
         {
             "notes": notes,
             "q": q,
+            "fallback": fallback,
             "active_note_path": None,
             "owned_paths": note_access.list_owned_by(conn, current_user(request)),
             "owner_map": owner_map,

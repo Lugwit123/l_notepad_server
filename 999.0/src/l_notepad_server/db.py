@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
   title TEXT NOT NULL,                  -- 展示名
   description TEXT NOT NULL DEFAULT '',
   workspace TEXT NOT NULL DEFAULT '',   -- 工作区本地目录（可预览其中的 .md 文档）
+  depot_library TEXT NOT NULL DEFAULT '/notes',  -- 归档到的 depot 库（逻辑路径首段）
+  depot_subpath TEXT NOT NULL DEFAULT '',        -- 库内子路径；空 = 用知识库名
+  depot_ws TEXT NOT NULL DEFAULT '',             -- depot 工作区名（空 = 用 notes-sync）
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -106,6 +109,27 @@ CREATE TABLE IF NOT EXISTS knowledge_articles (
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_articles_category ON knowledge_articles(kb_name, category_path);
 CREATE INDEX IF NOT EXISTS idx_knowledge_articles_owner ON knowledge_articles(kb_name, owner_username);
+
+-- 全文搜索索引文档表：登记已索引的文件（size/mtime 用于增量比对，body 原文用于生成摘要），
+-- rowid 与 search_fts 的 rowid 一一对应（FTS5 只能按 rowid 增删）。
+-- source='note'（个人笔记，rel 为笔记相对路径）/ 'kb'（知识库工作区文件，kb_name + rel）
+CREATE TABLE IF NOT EXISTS search_docs (
+  rowid INTEGER PRIMARY KEY,
+  note_path TEXT NOT NULL UNIQUE,       -- 索引键：笔记用 rel；知识库用 kb:<kb_name>:<rel>
+  source TEXT NOT NULL DEFAULT 'note',
+  kb_name TEXT NOT NULL DEFAULT '',
+  rel TEXT NOT NULL DEFAULT '',         -- 展示/打开用的相对路径
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL DEFAULT 0,
+  mtime REAL NOT NULL DEFAULT 0,
+  indexed_at TEXT NOT NULL
+);
+
+-- 倒排索引（FTS5）：写入前中文已按二元切分（unicode61 不会切汉字，整段汉字会变成一个 token）
+CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+  title, body, note_path UNINDEXED, tokenize='unicode61 remove_diacritics 2'
+);
 """
 
 
@@ -154,6 +178,15 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "knowledge_articles", "workspace_rel", "workspace_rel TEXT NOT NULL DEFAULT ''")
     # 工作区迁移：给知识库补 workspace 列（空 = 未配置工作区）
     _ensure_column(conn, "knowledge_bases", "workspace", "workspace TEXT NOT NULL DEFAULT ''")
+    # depot 归档映射迁移：库（默认 /notes）+ 库内子路径（空=知识库名）+ 工作区名
+    _ensure_column(conn, "knowledge_bases", "depot_library", "depot_library TEXT NOT NULL DEFAULT '/notes'")
+    _ensure_column(conn, "knowledge_bases", "depot_subpath", "depot_subpath TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "knowledge_bases", "depot_ws", "depot_ws TEXT NOT NULL DEFAULT ''")
+    # 搜索索引迁移：补来源列（旧行全是个人笔记）
+    _ensure_column(conn, "search_docs", "source", "source TEXT NOT NULL DEFAULT 'note'")
+    _ensure_column(conn, "search_docs", "kb_name", "kb_name TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "search_docs", "rel", "rel TEXT NOT NULL DEFAULT ''")
+    conn.execute("UPDATE search_docs SET rel = note_path WHERE rel = '' AND source = 'note'")
     conn.commit()
 
 

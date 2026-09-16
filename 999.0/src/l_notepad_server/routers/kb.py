@@ -7,21 +7,26 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from .. import depot_map
 from .. import file_store
 from .. import knowledge as kb
 from .. import note_access
+from .. import search_index
 from .deps import (
     current_user,
     get_conn,
@@ -29,11 +34,16 @@ from .deps import (
     get_templates,
     is_admin,
     template_ctx,
+    web_base,
 )
 
 router = APIRouter(tags=["kb"])
 
 log = logging.getLogger("l_notepad.kb")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class PublishRequest(BaseModel):
@@ -147,28 +157,39 @@ def _copy_note_to_workspace(
     return ws_rel
 
 
-def _depot_upload_content(kb_name: str, ws_rel: str, content: str, note_path: str = "") -> bool:
-    """把工作区文件内容提交到百度云版本库（depot），完成「自动上传到知识库」。
+def _depot_base_url() -> str:
+    return depot_map.base_url()
 
-    成功返回 True；失败仅记录日志并返回 False（不影响复制与打标）。
-    """
-    base = os.environ.get("L_DEPOT_SERVICE_URL", "http://127.0.0.1:1028").strip().rstrip("/")
-    url = base + "/api/depot/submit_stream"
-    depot_path = "/" + kb_name + "/" + ws_rel
-    desc = "来自个人笔记分享" + (f": {note_path}" if note_path else "")
-    qs = urllib.parse.urlencode({"path": depot_path, "description": desc})
+
+def _depot_error(exc: Exception) -> HTTPException:
+    detail = str(exc)
+    status = 404 if "不存在" in detail else 502
+    return HTTPException(status_code=status, detail=detail)
+
+
+def kb_depot_mapping(conn: sqlite3.Connection, kb_name: str) -> dict[str, Any]:
+    """知识库 depot 归档映射（库 / 子路径 / 工作区名 / 逻辑基路径）。"""
     try:
-        req = urllib.request.Request(
-            url + "?" + qs,
-            data=content.encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp.read()
-        return True
-    except Exception as exc:
-        log.warning("提交笔记到百度云版本库失败 %s: %s", depot_path, exc)
+        return depot_map.mapping(conn, kb_name)
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+
+
+def kb_depot_workspace(conn: sqlite3.Connection, kb_name: str) -> dict[str, Any]:
+    """确保知识库专属 depot 工作区存在并登记子路径映射。"""
+    try:
+        return depot_map.ensure_workspace(conn, kb_name)
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+
+
+def _depot_upload_content(conn: sqlite3.Connection, kb_name: str, ws_rel: str,
+                          content: str, note_path: str = "") -> bool:
+    """把工作区文件提交到 depot（`{library}/{subpath}/{rel}`）；失败只记日志。"""
+    try:
+        return depot_map.upload_content(conn, kb_name, ws_rel, content, note_path)
+    except depot_map.DepotError as exc:
+        log.warning("提交笔记到版本库失败 %s/%s: %s", kb_name, ws_rel, exc)
         return False
 
 
@@ -196,11 +217,16 @@ def kb_page(
     base = kb.get_base(conn, kb_name)
     if not base:
         raise HTTPException(status_code=404, detail="知识库不存在")
+    try:
+        depot_base = depot_map.mapping(conn, kb_name)["base_path"]
+    except depot_map.DepotError:
+        depot_base = f"/notes/{kb_name}"
     return templates.TemplateResponse(
         request,
         "web_kb.html",
         {
             "kb": base,
+            "depot_base": depot_base,
             "kb_tree": _category_tree(kb.list_categories(conn, kb_name)),
             **template_ctx(request),
         },
@@ -208,6 +234,120 @@ def kb_page(
 
 
 # ── REST：知识库 CRUD（/api/kb/bases）───────────────────
+
+
+class DepotMappingRequest(BaseModel):
+    library: Optional[str] = None   # None=不改；""=回到默认 /notes
+    subpath: Optional[str] = None   # None=不改；""=用知识库名
+    ws_name: Optional[str] = None   # None=不改；""=kb-<知识库名>
+
+
+@router.get("/api/kb/{kb_name}/depot")
+def api_kb_depot(kb_name: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """知识库的版本库归档映射（库 / 子路径 / 工作区 / 本地目录 / 逻辑基路径）。"""
+    return {"ok": True, **kb_depot_mapping(conn, kb_name)}
+
+
+@router.put("/api/kb/{kb_name}/depot")
+def api_kb_depot_save(
+    kb_name: str,
+    payload: DepotMappingRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """修改归档映射（库 / 库内子路径 / 工作区名）并重建工作区映射。"""
+    try:
+        info = depot_map.set_mapping(
+            conn, kb_name,
+            library=payload.library,
+            subpath=payload.subpath,
+            ws_name=payload.ws_name,
+        )
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+    return {"ok": True, **info}
+
+
+@router.get("/api/kb/{kb_name}/depot/list")
+def api_kb_depot_list(
+    kb_name: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+    rel: str = "",
+) -> dict[str, Any]:
+    """列出知识库归档子路径下的内容（默认归档根）。"""
+    try:
+        return {"ok": True, **depot_map.list_dir(conn, kb_name, rel=rel)}
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+
+
+@router.get("/api/kb/{kb_name}/depot/file")
+def api_kb_depot_file(
+    kb_name: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+    rel: str = "",
+    rev: int = 0,
+) -> Response:
+    """读取知识库归档文件（rev=0 最新），用于与本地/工作区内容比对。"""
+    try:
+        raw = depot_map.read_file(conn, kb_name, rel=rel, rev=rev)
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+    return Response(content=raw, media_type="text/plain; charset=utf-8")
+
+
+@router.post("/api/kb/{kb_name}/depot/submit")
+async def api_kb_depot_submit(
+    kb_name: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    rel: str = "",
+    description: str = "",
+) -> dict[str, Any]:
+    """把内容提交为知识库归档文件的新版本（body = 原始文本）。"""
+    raw = await request.body()
+    try:
+        return {"ok": True, **depot_map.submit_file(
+            conn, kb_name, rel=rel, content=raw, description=description)}
+    except depot_map.DepotError as exc:
+        raise _depot_error(exc) from exc
+
+
+@router.get("/api/kb/{kb_name}/search")
+def api_kb_search(
+    kb_name: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    notes_root: Path = Depends(get_notes_root),
+    q: str = "",
+    mode: str = "hybrid",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """在**单个知识库**范围内检索（倒排索引 + 语义），供知识库页面搜索框使用。
+
+    作用域在 SQL 内完成（`search_docs.kb_name`），不需要前端拉全量再过滤。
+    """
+    if not kb.get_base(conn, kb_name):
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    result = search_index.search(
+        conn,
+        notes_root,
+        q,
+        user=current_user(request),
+        admin=is_admin(request),
+        limit=limit,
+        offset=offset,
+        sources=["kb"],
+        kb_name=kb_name,
+        mode=(mode or "hybrid").strip().lower(),
+    )
+    hits = [
+        {**h, "open_url": f"{web_base(request)}/kb/{urllib.parse.quote(kb_name)}"
+                          f"?file={urllib.parse.quote(str(h.get('rel') or ''), safe='/')}"}
+        for h in result["hits"]
+    ]
+    return {"kb": kb_name, "query": q, "mode": mode, "limit": limit, "offset": offset,
+            **{**result, "hits": hits}}
 
 
 @router.get("/api/kb/bases")
@@ -297,7 +437,7 @@ def api_kb_publish(
         workspace_rel=ws_rel,
     )
     if ws_rel:
-        _depot_upload_content(kb_name, ws_rel, note.content, payload.note_path)
+        _depot_upload_content(conn, kb_name, ws_rel, note.content, payload.note_path)
     return {"ok": True, "article": kb.get_article(conn, kb_name, payload.note_path)}
 
 
@@ -477,7 +617,8 @@ def api_kb_publish_legacy(
         workspace_rel=ws_rel,
     )
     if ws_rel:
-        _depot_upload_content("", ws_rel, note.content, payload.note_path)
+        # 旧接口（无知识库名）归入默认知识库的映射
+        _depot_upload_content(conn, kb._DEFAULT_BASE, ws_rel, note.content, payload.note_path)
     return {"ok": True, "article": kb.get_article(conn, "", payload.note_path)}
 
 
