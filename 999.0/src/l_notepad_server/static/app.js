@@ -189,3 +189,85 @@
     prefs.apply();
   })();
 })();
+
+/* ══ 搜索结果渲染（顶栏弹窗 与「搜索索引」页 共用同一份，保证样式一致）══
+   用法：container.innerHTML = LN.renderSearchHits(d.hits)（或拿返回值自行包裹） */
+(function () {
+  window.LN = window.LN || {};
+
+  function esc(s) {
+    return String(s === null || s === undefined ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+  function num(v, d) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(d); }
+  function pct(v) { return (v === null || v === undefined) ? 0 : Math.round(v * 100); }
+
+  /* 命中词高亮：先转义，再按位置区间套 <mark>（相邻/重叠合并） */
+  function hl(text, terms) {
+    var safe = esc(text), low = safe.toLowerCase(), spans = [];
+    (terms || []).slice().sort(function (a, b) { return b.length - a.length; })
+      .forEach(function (t) {
+        var needle = esc(t).toLowerCase();
+        if (!needle) return;
+        var from = 0;
+        while (spans.length < 200) {
+          var p = low.indexOf(needle, from);
+          if (p < 0) break;
+          spans.push([p, p + needle.length]);
+          from = p + 1;
+        }
+      });
+    if (!spans.length) return safe;
+    spans.sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    spans.forEach(function (s) {
+      var last = merged[merged.length - 1];
+      if (last && s[0] <= last[1]) last[1] = Math.max(last[1], s[1]);
+      else merged.push([s[0], s[1]]);
+    });
+    var out = "", at = 0;
+    merged.forEach(function (s) {
+      out += safe.slice(at, s[0]) + "<mark>" + safe.slice(s[0], s[1]) + "</mark>";
+      at = s[1];
+    });
+    return out + safe.slice(at);
+  }
+
+  function sig(label, value, tip, extra) {
+    return '<span class="sig' + (extra || "") + '" title="' + esc(tip || "") + '">' +
+      label + " <b>" + value + "</b></span>";
+  }
+  function bar(v, cls) {
+    return '<i class="mini' + (cls || "") + '"><s style="width:' + pct(v) + '%"></s></i>';
+  }
+
+  /* 单条命中 → .hit 片段 */
+  function renderHit(h) {
+    var hot = (h.phrase_hits || 0) > 0;
+    return '<div class="hit' + (hot ? " hot" : "") + '">' +
+      '<div class="hit-head"><a href="' + esc(h.open_url) + '">' +
+      (h.source === "kb" ? "📚 " : "📝 ") + esc(h.rel) + "</a>" +
+      '<span class="badge-score" title="综合相关度：3×短语 + 2×覆盖率 + 词频 + 近邻 − 1.5×bm25">' +
+      num(h.score, 2) + "</span></div>" +
+      '<div class="snip">' + hl(h.snippet, h.matches) + "</div>" +
+      '<div class="signals">' +
+      (hot ? '<span class="sig hot-sig" title="引号短语精确命中次数">短语 <b>' + h.phrase_hits + "</b></span>" : "") +
+      '<span class="sig main" title="查询词块有多少出现在本文（越高越好）">覆盖 <b>' + pct(h.coverage) + "%</b>" +
+      bar(h.coverage, " cov") + "</span>" +
+      '<span class="sig main" title="命中词块相近程度：1.0 最集中（200 字符内）">近邻 <b>' + num(h.proximity, 2) + "</b>" +
+      bar(h.proximity, " prox") + "</span>" +
+      (h.vec ? '<span class="sig main" title="向量语义相似度（余弦）">语义 <b>' + num(h.vec, 3) + "</b></span>" : "") +
+      sig("词频", num(h.tf, 2), "词块出现次数加权（单块封顶 5 次）", " dim") +
+      sig("bm25", num(h.bm25, 2), "倒排引擎原始分（越负越相关，取负后计入总分）", " dim") +
+      '<span class="sig dim when">' + esc((h.updated_at || "").replace("T", " ").slice(0, 16)) + "</span>" +
+      "</div></div>";
+  }
+
+  LN.renderSearchHits = function (hits) {
+    hits = hits || [];
+    if (!hits.length) return '<div class="muted">无命中</div>';
+    return hits.map(renderHit).join("");
+  };
+  LN.searchHitEsc = esc;
+})();

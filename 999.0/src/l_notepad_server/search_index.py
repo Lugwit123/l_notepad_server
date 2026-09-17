@@ -3,9 +3,10 @@
 
 目标：像搜索引擎一样「查索引」，而不是每次请求把每篇文档读一遍。
 
-索引源（两类）：
+索引源（两类，都不依赖「本机工作区目录」）：
   - 个人笔记：`notepad_list` 下所有文件（source='note'，权限按归属/共享判定）
-  - 知识库工作区：各知识库 `workspace` 目录下的文本文件（source='kb'，登录可见）
+  - 知识库归档：各知识库**已上传到 depot 服务**的版本（source='kb'，登录可见）；
+    本机工作区目录只用于上传 / 编辑，不参与索引
 
 召回与排序：
   - 中文按二元切分（bigram）入索引（unicode61 不切汉字，整段汉字会变成一个 token）；
@@ -15,10 +16,11 @@
   - 排序：命中短语 > 覆盖率 > 词频/近邻度 > bm25（标题权重 6 / 正文 1），
     即「创建包」连写的文档排在只命中「创建」的文档前面，接近搜索引擎行为。
 
-增量更新：
-  - 服务内增删改经 file_store 变更通知即时标脏，下次查询补索引；
-  - 桌面端直接落盘 / 托盘写入等外部改动由 TTL 全量比对（只 stat 比 mtime/size，
-    内容没变不读文件）兜底。
+构建时机：
+  - 笔记：服务内增删改经 file_store 变更通知即时标脏，下次查询补索引；桌面端直接落盘 /
+    托盘写入等外部改动由 TTL 全量比对（只 stat 比 mtime/size，内容没变不读文件）兜底。
+  - 知识库：上传 / 提交 / 发布 / 取消发布后**事件即时**刷新对应知识库（后台线程，不占用
+    请求）；后台 ticker 每 KB_SCAN_TTL_S 秒列归档目录比对 rev 兜底；服务启动预热一次。
 """
 from __future__ import annotations
 
@@ -35,6 +37,15 @@ from . import file_store
 MAX_INDEX_BYTES = 2 * 1024 * 1024
 # 外部改动（不经过本服务钩子）允许的最长陈旧时间（全量比对只 stat，不读文件，开销很小）
 SCAN_TTL_S = 5.0
+# 知识库归档（depot）兜底扫描间隔：事件即时刷新之外的保险，列目录比对 rev 才下载内容
+KB_SCAN_TTL_S = 300.0
+# 事件触发后的防抖窗口：连续多次提交合并成一次同步
+KB_DEBOUNCE_S = 1.0
+# 全量扫描/同步期间每处理多少篇提交一次（及时释放 SQLite 写锁，避免别的请求 database is locked）
+_COMMIT_EVERY = 25
+# 单次知识库同步的下载配额（html 文本，避免一轮把整库内容都读进内存）
+_KB_FETCH_MAX_DOCS = 100
+_KB_FETCH_BYTES = 32 * 1024 * 1024
 # 单次检索返回条数上限
 MAX_LIMIT = 500
 # 重排取回的候选倍数（先按 bm25 取 offset+limit 的 K 倍，再按相关性重排）
@@ -85,6 +96,25 @@ _lock = threading.Lock()
 _refresh_lock = threading.Lock()
 _pending: dict[str, str] = {}      # 笔记相对路径 -> 'upsert' | 'delete'
 _last_scan: dict[str, float] = {}  # notes_root(str) -> monotonic
+
+# 知识库（depot 归档）同步：事件标脏 + 后台线程（防抖合并），请求路径一律不碰网络
+_kb_pending: set[str] = set()      # 待同步的知识库名
+_kb_errors: dict[str, str] = {}    # 知识库名 -> 最近一次同步错误（状态页展示）
+_kb_last_sync: dict[str, float] = {}   # 知识库名 -> monotonic
+_kb_skip: dict[tuple[str, str], int] = {}   # (知识库, rel) -> 取不到内容的 rev（避免反复重试）
+_kb_more: set[str] = set()             # 因下载配额提前结束的知识库（本轮末尾继续同步）
+_kb_wake = threading.Event()
+_kb_started = False
+
+# 启动预热状态（首个查询不再承担全量建索引的耗时）
+_warm_state: dict[str, Any] = {
+    "running": False,
+    "phase": "",        # notes（笔记全量比对）/ kb（逐个知识库同步）
+    "updated": 0,
+    "started_at": "",
+    "finished_at": "",
+    "error": "",
+}
 
 # 后台重建索引的任务状态（供「搜索索引」状态页轮询显示进度）
 _reindex_state: dict[str, Any] = {
@@ -374,6 +404,7 @@ def _upsert(
     source: str = "note",
     kb_name: str = "",
     rel: str = "",
+    rev: int = 0,
 ) -> None:
     """写入/覆盖一篇文档（rowid 不变，FTS 行先删后插）。"""
     rel = rel or key
@@ -381,17 +412,17 @@ def _upsert(
     rowid = _rowid(conn, key)
     if rowid is None:
         cur = conn.execute(
-            "INSERT INTO search_docs(note_path, source, kb_name, rel, title, body, size, mtime, indexed_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (key, source, kb_name, rel, rel, body, size, mtime, now),
+            "INSERT INTO search_docs(note_path, source, kb_name, rel, title, body, size, mtime, rev, indexed_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (key, source, kb_name, rel, rel, body, size, mtime, int(rev), now),
         )
         rowid = int(cur.lastrowid)
     else:
         conn.execute("DELETE FROM search_fts WHERE rowid = ?", (rowid,))
         conn.execute(
             "UPDATE search_docs SET source = ?, kb_name = ?, rel = ?, title = ?, body = ?,"
-            " size = ?, mtime = ?, indexed_at = ? WHERE rowid = ?",
-            (source, kb_name, rel, rel, body, size, mtime, now, rowid),
+            " size = ?, mtime = ?, rev = ?, indexed_at = ? WHERE rowid = ?",
+            (source, kb_name, rel, rel, body, size, mtime, int(rev), now, rowid),
         )
     conn.execute(
         "INSERT INTO search_fts(rowid, title, body, note_path) VALUES(?,?,?,?)",
@@ -407,26 +438,27 @@ def _drop(conn, key: str) -> None:
     conn.execute("DELETE FROM search_docs WHERE rowid = ?", (rowid,))
 
 
-def _index_file(conn, root: Path, rel: str, size: int, mtime: float, *, source: str, kb_name: str) -> None:
+def _index_file(conn, root: Path, rel: str, size: int, mtime: float) -> None:
     body = file_store.read_text_capped(file_store.resolve_note_path(root, rel), MAX_INDEX_BYTES)
-    key = rel if source == "note" else _kb_key(kb_name, rel)
-    _upsert(conn, key, body, size, mtime, source=source, kb_name=kb_name, rel=rel)
+    _upsert(conn, rel, body, size, mtime, source="note")
 
 
 def _sources(conn, notes_root: Path) -> list[tuple[str, str, Path]]:
-    """索引源列表：[(source, kb_name, root)]，含所有配置了工作区的知识库。"""
-    sources: list[tuple[str, str, Path]] = [("note", "", Path(notes_root))]
-    for name, ws in conn.execute(
-        "SELECT name, workspace FROM knowledge_bases WHERE workspace <> '' ORDER BY name"
-    ):
-        root = Path(str(ws))
-        if root.is_dir():
-            sources.append(("kb", str(name), root))
-    return sources
+    """索引源：只有个人笔记目录（知识库改走 depot 归档，见 `kb_bases` / `sync_kb`）。"""
+    return [("note", "", Path(notes_root))]
+
+
+def kb_bases(conn) -> list[str]:
+    """全部知识库名（索引源，与该库是否配置本机工作区无关）。"""
+    try:
+        rows = conn.execute("SELECT name FROM knowledge_bases ORDER BY name").fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(r["name"]) for r in rows if str(r["name"] or "").strip()]
 
 
 def _scan(conn, source: str, kb_name: str, root: Path, *, progress: bool = False) -> int:
-    """全量比对 mtime/size，只重读变化过的文件；清理该来源下磁盘上已消失的索引行。
+    """全量比对 mtime/size，只重读变化过的文件；清理磁盘上已消失的索引行（笔记源）。
 
     `progress=True` 时把处理进度写进 `_reindex_state`（供状态页显示进度条）。
     """
@@ -443,29 +475,241 @@ def _scan(conn, source: str, kb_name: str, root: Path, *, progress: bool = False
     for p in root.rglob("*"):
         if not p.is_file():
             continue
-        if source == "kb" and p.suffix.lower() not in WORKSPACE_EXTS:
-            continue
         try:
             st = p.stat()
         except OSError:
             continue
         rel = p.relative_to(root).as_posix()
-        key = rel if source == "note" else _kb_key(kb_name, rel)
-        prev = known.pop(key, None)
+        prev = known.pop(rel, None)
         if prev is None or prev[0] != st.st_size or abs(prev[1] - st.st_mtime) >= 1e-6:
             try:
-                _index_file(conn, root, rel, st.st_size, st.st_mtime, source=source, kb_name=kb_name)
+                _index_file(conn, root, rel, st.st_size, st.st_mtime)
             except (OSError, ValueError):
                 pass
             else:
                 touched += 1
+                if touched % _COMMIT_EVERY == 0:
+                    conn.commit()   # 及时释放写锁：全量扫描期间别把库锁住
         if progress:
-            with _lock:
-                _reindex_state["done"] = int(_reindex_state.get("done", 0)) + 1
+            _bump_progress()
     for key in known:
         _drop(conn, key)
         touched += 1
+        if touched % _COMMIT_EVERY == 0:
+            conn.commit()
     return touched
+
+
+def _bump_progress() -> None:
+    with _lock:
+        _reindex_state["done"] = int(_reindex_state.get("done", 0)) + 1
+
+
+# ── 知识库索引源：depot 已上传归档 ────────────────────────
+
+
+def _kb_sync_one(conn, kb_name: str, *, progress: bool = False) -> int:
+    """把某知识库的索引同步到 depot 归档现状（size/rev 未变的文件不下载内容）。
+
+    两阶段：**先把要更新的内容全部下载到内存**（HTTP 期间不持有写事务），再逐篇写库并
+    立即提交。否则下载几十秒期间写锁一直被占，别的请求写库会 `database is locked`
+    （知识库总览页的 `ensure_default_base` 就是受害者）。
+    """
+    from . import depot_map
+
+    tree = depot_map.list_tree(conn, kb_name, exts=WORKSPACE_EXTS)
+    known = {
+        str(r["rel"]): (int(r["size"]), int(r["rev"]))
+        for r in conn.execute(
+            "SELECT rel, size, rev FROM search_docs WHERE source = 'kb' AND kb_name = ?", (kb_name,)
+        )
+    }
+    # 阶段 1：下载（不持有写事务）；单次有配额，剩下的本轮末尾再来
+    fetched: list[tuple[str, int, int, str]] = []
+    alive: set[str] = set()   # 归档里仍在的 rel（不在里面的索引行才算被删除）
+    budget = _KB_FETCH_BYTES
+    stopped_early = False
+    for f in tree["files"]:
+        rel = str(f["rel"])
+        size, rev = int(f["size"]), int(f["rev"])
+        alive.add(rel)
+        if known.get(rel) == (size, rev):
+            continue
+        if len(fetched) >= _KB_FETCH_MAX_DOCS or budget <= 0:
+            stopped_early = True
+            break
+        skip_key = (kb_name, rel)
+        with _lock:
+            if _kb_skip.get(skip_key) == rev:   # 该版本内容取不到（blob 缺失等），不反复重试
+                continue
+        try:
+            text = depot_map.read_text(conn, kb_name, rel=rel, rev=rev, max_bytes=MAX_INDEX_BYTES)
+        except depot_map.DepotError:
+            with _lock:
+                _kb_skip[skip_key] = rev
+            continue
+        with _lock:
+            _kb_skip.pop(skip_key, None)
+        fetched.append((rel, size, rev, text))
+        budget -= len(text.encode("utf-8", "ignore"))
+    with _lock:
+        if stopped_early:
+            _kb_more.add(kb_name)   # 还有没下载完的，本轮末尾继续
+        else:
+            _kb_more.discard(kb_name)
+    # 阶段 2：写库（每篇一提交，写锁只占几十毫秒）
+    touched = 0
+    for rel, size, rev, text in fetched:
+        _upsert(conn, _kb_key(kb_name, rel), text, size, 0.0,
+                source="kb", kb_name=kb_name, rel=rel, rev=rev)
+        conn.commit()
+        touched += 1
+        if progress:
+            _bump_progress()
+    if stopped_early:
+        stale: list[str] = []   # 目录没列完，先不判"已删除"，免得误删还没比对到的行
+    else:
+        stale = [rel for rel in known if rel not in alive]
+    for rel in stale:  # 归档里已删除 / 移走的文件
+        _drop(conn, _kb_key(kb_name, rel))
+        with _lock:
+            _kb_skip.pop((kb_name, rel), None)
+        touched += 1
+        if touched % _COMMIT_EVERY == 0:
+            conn.commit()
+    if touched % _COMMIT_EVERY:
+        conn.commit()
+    return touched
+
+
+def sync_kb(conn, kb_name: str) -> int:
+    """同步单个知识库的归档索引（归档服务不可用只记状态，不抛给调用方）。"""
+    try:
+        changed = _kb_sync_one(conn, kb_name)
+    except Exception as exc:  # noqa: BLE001 - depot 不可用不该影响检索
+        with _lock:
+            _kb_errors[kb_name] = f"{type(exc).__name__}: {exc}"
+        return 0
+    with _lock:
+        _kb_errors.pop(kb_name, None)
+        _kb_last_sync[kb_name] = time.monotonic()
+    return changed
+
+
+def notify_kb_change(kb_name: str = "") -> None:
+    """知识库内容变化（上传 / 提交 / 发布 / 取消发布）→ 让后台线程即时同步。
+
+    `kb_name` 为空表示「所有知识库」（如改了归档映射）。
+    """
+    with _lock:
+        _kb_pending.add(str(kb_name or "").strip() or "*")
+    _kb_wake.set()
+
+
+def _kb_worker(db_path: Path, notes_root: Path) -> None:
+    """知识库索引维护线程：事件即时同步 + KB_SCAN_TTL_S 兜底全量（列目录比对 rev）。"""
+    from . import db as dbmod
+
+    while True:
+        woke = _kb_wake.wait(timeout=KB_SCAN_TTL_S)
+        _kb_wake.clear()
+        if woke:
+            time.sleep(KB_DEBOUNCE_S)  # 防抖：连续提交合并成一次同步
+        with _lock:
+            names = set(_kb_pending)
+            _kb_pending.clear()
+        tick = not names  # 超时醒来 → 兜底扫全部（覆盖其它客户端上传的内容）
+        try:
+            conn = dbmod.connect(db_path)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            todo = kb_bases(conn) if (tick or "*" in names) else sorted(n for n in names if n != "*")
+            while todo:   # 命中下载配额的知识库排到本轮末尾继续，不必等下一次 tick
+                name = todo.pop(0)
+                sync_kb(conn, name)
+                with _lock:
+                    more = name in _kb_more
+                if more:
+                    todo.append(name)
+                    time.sleep(0.2)
+        except Exception:  # noqa: BLE001 - 后台线程不因单次失败退出
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def ensure_kb_worker(db_path: Path, notes_root: Path) -> None:
+    """启动知识库索引维护线程（幂等）。"""
+    global _kb_started
+    with _lock:
+        if _kb_started:
+            return
+        _kb_started = True
+    threading.Thread(
+        target=_kb_worker, args=(Path(db_path), Path(notes_root)), name="search_kb", daemon=True
+    ).start()
+
+
+def warm_start(db_path: Path, notes_root: Path) -> bool:
+    """启动预热：后台先全量比对笔记、再同步各知识库，让首个查询不再承担建索引耗时。"""
+    with _lock:
+        if _warm_state.get("running"):
+            return False
+        _warm_state.update({
+            "running": True, "phase": "notes", "updated": 0,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": "", "error": "",
+        })
+    ensure_kb_worker(db_path, notes_root)
+    threading.Thread(
+        target=_warm_worker, args=(Path(db_path), Path(notes_root)), name="search_warm", daemon=True
+    ).start()
+    return True
+
+
+def _warm_worker(db_path: Path, notes_root: Path) -> None:
+    from . import db as dbmod
+
+    try:
+        conn = dbmod.connect(db_path)
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            _warm_state.update({"running": False, "error": f"{type(exc).__name__}: {exc}"})
+        return
+    try:
+        updated = _refresh(conn, notes_root, force=True)
+        with _lock:
+            _warm_state["phase"] = "kb"
+            _warm_state["updated"] = updated
+        for name in kb_bases(conn):
+            updated += sync_kb(conn, name)
+            with _lock:
+                _warm_state["updated"] = updated
+        with _lock:
+            rest = bool(_kb_more)   # 命中下载配额的库交给维护线程收尾
+        if rest:
+            notify_kb_change("")
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            _warm_state["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        with _lock:
+            _warm_state["running"] = False
+            _warm_state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def warm_state() -> dict[str, Any]:
+    """启动预热状态快照。"""
+    with _lock:
+        return dict(_warm_state)
 
 
 def _count_disk_files(root: Path, source: str) -> int:
@@ -480,6 +724,16 @@ def _count_disk_files(root: Path, source: str) -> int:
             continue
         total += 1
     return total
+
+
+def _count_kb_files(conn, kb_name: str) -> int:
+    """归档里「应当被索引」的文件数（0 = 归档服务不可用，只影响进度条总量）。"""
+    from . import depot_map
+
+    try:
+        return len(depot_map.list_tree(conn, kb_name, exts=WORKSPACE_EXTS)["files"])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def refresh(conn, notes_root: Path, *, force: bool = False) -> int:
@@ -517,11 +771,11 @@ def _refresh(conn, notes_root: Path, *, force: bool = False) -> int:
             continue
         try:
             st = p.stat()
-            _index_file(conn, root, rel, st.st_size, st.st_mtime, source="note", kb_name="")
+            _index_file(conn, root, rel, st.st_size, st.st_mtime)
         except (OSError, ValueError):
             continue
         touched += 1
-    # 2) TTL 全量比对（含知识库工作区）
+    # 2) TTL 全量比对（笔记目录；知识库归档由后台线程按事件/TTL 同步，请求路径不走网络）
     if due:
         for source, kb_name, src_root in _sources(conn, root):
             touched += _scan(conn, source, kb_name, src_root)
@@ -531,7 +785,7 @@ def _refresh(conn, notes_root: Path, *, force: bool = False) -> int:
 
 
 def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
-    """清空并全量重建索引（含知识库工作区）。"""
+    """清空并全量重建索引（笔记目录 + 各知识库归档）。"""
     with _refresh_lock:
         conn.execute("DELETE FROM search_fts")
         conn.execute("DELETE FROM search_docs")
@@ -544,18 +798,21 @@ def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
                 _reindex_state["total"] = sum(
                     _count_disk_files(root, source)
                     for source, _kb_name, root in _sources(conn, Path(notes_root))
-                )
+                ) + sum(_count_kb_files(conn, name) for name in kb_bases(conn))
         touched = 0
         with _lock:
             _reindex_state["phase"] = "indexing"
         for source, kb_name, root in _sources(conn, Path(notes_root)):
             touched += _scan(conn, source, kb_name, root, progress=progress)
             conn.commit()
+        for name in kb_bases(conn):
+            touched += _kb_sync_one(conn, name, progress=progress)
+            conn.commit()
         return touched
 
 
 def reindex(conn, notes_root: Path) -> int:
-    """同步重建全部索引（含知识库工作区），返回写入/删除的索引行数。"""
+    """同步重建全部索引（笔记目录 + 各知识库归档），返回写入/删除的索引行数。"""
     return _rebuild(conn, notes_root)
 
 
@@ -625,10 +882,105 @@ def _vec_stats(conn) -> dict[str, Any]:
         return {"available": {"available": False, "reason": f"{type(exc).__name__}: {exc}"}}
 
 
-def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
-    """索引状态：总量、分来源明细、增量队列、后台重建进度。
+def _verify_notes(conn, root: Path) -> dict[str, int]:
+    """笔记源磁盘校对：磁盘文件数 / 未索引 / mtime 过期 / 多余行。"""
+    indexed = {
+        r["rel"]: (int(r["size"]), float(r["mtime"]))
+        for r in conn.execute("SELECT rel, size, mtime FROM search_docs WHERE source = 'note'")
+    }
+    disk = missing = changed = 0
+    seen: set[str] = set()
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        disk += 1
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rel = p.relative_to(root).as_posix()
+        seen.add(rel)
+        prev = indexed.get(rel)
+        if prev is None:
+            missing += 1
+        elif prev[0] != st.st_size or abs(prev[1] - st.st_mtime) >= 1e-6:
+            changed += 1
+    return {
+        "disk_files": disk,
+        "missing": missing,
+        "changed": changed,
+        "extra": len([k for k in indexed if k not in seen]),
+    }
 
-    `deep=True` 时额外做磁盘校对（统计磁盘文件数 / 索引缺失 / 版本过期）与 FTS 完整性检查。
+
+def _verify_kb(conn, kb_name: str) -> dict[str, Any]:
+    """归档校对：列 depot 目录比对 rev（网络失败只返回错误，不算差异）。"""
+    from . import depot_map
+
+    indexed = {
+        str(r["rel"]): (int(r["size"]), int(r["rev"]))
+        for r in conn.execute(
+            "SELECT rel, size, rev FROM search_docs WHERE source = 'kb' AND kb_name = ?", (kb_name,)
+        )
+    }
+    try:
+        files = depot_map.list_tree(conn, kb_name, exts=WORKSPACE_EXTS)["files"]
+    except Exception as exc:  # noqa: BLE001
+        return {"disk_files": len(indexed), "missing": 0, "changed": 0, "extra": 0,
+                "verify_error": f"{type(exc).__name__}: {exc}"}
+    missing = changed = unavailable = 0
+    seen: set[str] = set()
+    for f in files:
+        rel = str(f["rel"])
+        seen.add(rel)
+        prev = indexed.get(rel)
+        if prev is None:
+            with _lock:
+                skipped = _kb_skip.get((kb_name, rel)) == int(f["rev"])
+            if skipped:
+                unavailable += 1   # 归档有元数据但 blob 取不到（同步时已跳过，不算缺失）
+            else:
+                missing += 1
+        elif prev != (int(f["size"]), int(f["rev"])):
+            changed += 1
+    return {"disk_files": len(files), "missing": missing, "changed": changed,
+            "unavailable": unavailable,
+            "extra": len([k for k in indexed if k not in seen])}
+
+
+def _kb_source_rows(conn, by_source) -> list[dict[str, Any]]:
+    """知识库源明细（索引文档数来自库表，根路径来自归档映射，不访问网络）。"""
+    from . import depot_map
+
+    rows: list[dict[str, Any]] = []
+    for name in kb_bases(conn):
+        row = by_source.get(("kb", name))
+        try:
+            base = depot_map.mapping(conn, name)["base_path"]
+        except Exception:  # noqa: BLE001 - 知识库不存在等
+            base = f"/notes/{name}"
+        with _lock:
+            err = _kb_errors.get(name, "")
+            last = _kb_last_sync.get(name)
+        rows.append({
+            "source": "kb",
+            "kb_name": name,
+            "root": f"depot:{base}",
+            "exists": True,
+            "docs": int(row["docs"]) if row else 0,
+            "bytes": int(row["bytes"] or 0) if row else 0,
+            "last_indexed_at": (row["last_indexed_at"] if row else "") or "",
+            "newest_mtime": "",   # 归档按 rev 而非 mtime 增量
+            "last_sync_ago": round(time.monotonic() - last, 1) if last is not None else None,
+            "error": err,
+        })
+    return rows
+
+
+def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
+    """索引状态：总量、分来源明细、增量队列、启动预热与后台重建进度。
+
+    `deep=True` 时额外校对（笔记比对磁盘、知识库比对归档 rev）与 FTS 完整性检查。
     """
     root = Path(notes_root)
     docs = conn.execute("SELECT COUNT(*) AS c FROM search_docs").fetchone()["c"]
@@ -659,37 +1011,17 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
             "newest_mtime": _iso(float(row["newest_mtime"])) if row and row["newest_mtime"] else "",
         }
         if deep and item["exists"]:
-            indexed = {
-                r["rel"]: (int(r["size"]), float(r["mtime"]))
-                for r in conn.execute(
-                    "SELECT rel, size, mtime FROM search_docs WHERE source = ? AND kb_name = ?",
-                    (source, kb_name),
-                )
-            }
-            disk = 0
-            missing = 0
-            changed = 0
-            seen: set[str] = set()
-            for p in src_root.rglob("*"):
-                if not p.is_file():
-                    continue
-                if source == "kb" and p.suffix.lower() not in WORKSPACE_EXTS:
-                    continue
-                disk += 1
-                try:
-                    st = p.stat()
-                except OSError:
-                    continue
-                rel = p.relative_to(src_root).as_posix()
-                seen.add(rel)
-                prev = indexed.get(rel)
-                if prev is None:
-                    missing += 1
-                elif prev[0] != st.st_size or abs(prev[1] - st.st_mtime) >= 1e-6:
-                    changed += 1
-            extra = len([k for k in indexed if k not in seen])
-            item.update({"disk_files": disk, "missing": missing, "changed": changed, "extra": extra})
+            item.update(_verify_notes(conn, src_root))
         sources.append(item)
+
+    kb_rows = _kb_source_rows(conn, by_source)
+    if deep:
+        for item in kb_rows:
+            item.update(_verify_kb(conn, str(item["kb_name"])))
+    sources.extend(kb_rows)
+
+    with _lock:
+        kb_pending = sorted(_kb_pending)
 
     result: dict[str, Any] = {
         "docs": int(docs),
@@ -705,6 +1037,9 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
         ),
         "max_index_bytes": MAX_INDEX_BYTES,
         "workspace_exts": sorted(WORKSPACE_EXTS),
+        "kb_scan_ttl_s": KB_SCAN_TTL_S,
+        "kb_pending": kb_pending,
+        "warm": warm_state(),
         "reindex": reindex_state(),
         "deep": bool(deep),
     }
@@ -731,6 +1066,12 @@ __all__ = [
     "parse_query",
     "build_match_expr",
     "index_text",
+    "kb_bases",
+    "sync_kb",
+    "notify_kb_change",
+    "ensure_kb_worker",
+    "warm_start",
+    "warm_state",
     "MAX_INDEX_BYTES",
     "WORKSPACE_EXTS",
 ]

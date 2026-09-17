@@ -110,9 +110,10 @@ CREATE TABLE IF NOT EXISTS knowledge_articles (
 CREATE INDEX IF NOT EXISTS idx_knowledge_articles_category ON knowledge_articles(kb_name, category_path);
 CREATE INDEX IF NOT EXISTS idx_knowledge_articles_owner ON knowledge_articles(kb_name, owner_username);
 
--- 全文搜索索引文档表：登记已索引的文件（size/mtime 用于增量比对，body 原文用于生成摘要），
+-- 全文搜索索引文档表：登记已索引的文件（增量比对字段见下，body 原文用于生成摘要），
 -- rowid 与 search_fts 的 rowid 一一对应（FTS5 只能按 rowid 增删）。
--- source='note'（个人笔记，rel 为笔记相对路径）/ 'kb'（知识库工作区文件，kb_name + rel）
+-- source='note'（个人笔记，本机文件，size/mtime 比对）/ 'kb'（知识库归档内容，来自 depot
+-- 已上传版本，size/rev 比对；本机工作区目录不参与索引）
 CREATE TABLE IF NOT EXISTS search_docs (
   rowid INTEGER PRIMARY KEY,
   note_path TEXT NOT NULL UNIQUE,       -- 索引键：笔记用 rel；知识库用 kb:<kb_name>:<rel>
@@ -123,6 +124,7 @@ CREATE TABLE IF NOT EXISTS search_docs (
   body TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
   mtime REAL NOT NULL DEFAULT 0,
+  rev INTEGER NOT NULL DEFAULT 0,       -- depot 归档版本号（source='kb' 的增量比对字段）
   indexed_at TEXT NOT NULL
 );
 
@@ -182,10 +184,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "knowledge_bases", "depot_library", "depot_library TEXT NOT NULL DEFAULT '/notes'")
     _ensure_column(conn, "knowledge_bases", "depot_subpath", "depot_subpath TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "knowledge_bases", "depot_ws", "depot_ws TEXT NOT NULL DEFAULT ''")
-    # 搜索索引迁移：补来源列（旧行全是个人笔记）
+    # 搜索索引迁移：补来源列（旧行全是个人笔记）+ 归档版本列（知识库源改从 depot 取）
     _ensure_column(conn, "search_docs", "source", "source TEXT NOT NULL DEFAULT 'note'")
     _ensure_column(conn, "search_docs", "kb_name", "kb_name TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "search_docs", "rel", "rel TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "search_docs", "rev", "rev INTEGER NOT NULL DEFAULT 0")
     conn.execute("UPDATE search_docs SET rel = note_path WHERE rel = '' AND source = 'note'")
     conn.commit()
 

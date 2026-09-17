@@ -155,8 +155,13 @@ def create_app(db_path: Path) -> FastAPI:
     file_store.ensure_root(notes_root)
     app.state.notes_root = notes_root
 
-    # 搜索索引：订阅笔记变更通知（索引在首次查询时惰性增量构建）
+    # 搜索索引：订阅笔记变更通知；启动即后台预热（笔记全量比对 + 各知识库归档同步），
+    # 让首个查询不再承担建索引耗时；此后知识库走事件即时 + 低频兜底扫描
     search_index.install()
+    try:
+        search_index.warm_start(db_path, notes_root)
+    except Exception as _e:  # noqa: BLE001 - 预热失败不影响启动
+        lprint(f"[l_notepad] 搜索索引预热跳过: {_e}")
     # 向量（语义检索）表：vec_docs / vec_chunks，未启 embedding 时只是空表
     try:
         search_vec.init_schema(conn)

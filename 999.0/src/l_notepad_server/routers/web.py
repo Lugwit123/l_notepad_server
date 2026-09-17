@@ -149,15 +149,10 @@ def login_page(request: Request) -> HTMLResponse:
 # ── 状态页 ──
 
 
-@router.get("/", response_class=HTMLResponse)
-def index(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> HTMLResponse:
-    templates = get_templates(request)
-    notes = accessible_brief(request, conn, limit=200)
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {"notes": notes, "owner_map": note_access.owner_map(conn), **template_ctx(request)},
-    )
+@router.get("/")
+def index(request: Request) -> RedirectResponse:
+    """入口直接进「我的笔记」（原欢迎页 index.html 已删除）。"""
+    return RedirectResponse(url=mounted_url(request, "web"), status_code=302)
 
 
 # ── 服务器日志查看页（管理员）── 注意：必须在 /web/{note_path:path} 之前注册

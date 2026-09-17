@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/search", tags=["search"])
 
 
 def _open_url(request: Request, hit: dict[str, Any]) -> str:
-    """命中项的前端打开地址：笔记 → 编辑页；知识库工作区 → 知识库页并定位文件。"""
+    """命中项的前端打开地址：笔记 → 编辑页；知识库归档 → 知识库页并定位文档。"""
     rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
     if hit.get("source") == "kb":
         return f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={rel}"
@@ -40,7 +40,7 @@ def api_search(
 
     - 宽召回：中文按 bigram OR 召回，命中短语 > 覆盖率 > bm25 排序；
       查询里用 `"引号"` 包住可要求精确短语。
-    - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库工作区），默认全部。
+    - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库归档），默认全部。
     - `mode`：`hybrid`（默认，词法 + 语义加分，词法空时语义兜底）/ `lex`（纯词法）/ `sem`（纯语义）。
     - 返回 hits：命中的来源、相对路径、打开地址 open_url、摘要、命中词 matches、
       覆盖率 / 词频 / 近邻 / bm25 / 语义相似度 vec / 总分 score。
@@ -132,9 +132,9 @@ def api_stats(
     notes_root: Path = Depends(get_notes_root),
     deep: int = 0,
 ) -> dict[str, Any]:
-    """索引状态：文档数 / 分来源明细 / 增量队列 / 后台重建进度。
+    """索引状态：文档数 / 分来源明细 / 增量队列 / 预热与后台重建进度。
 
-    `deep=1` 额外做磁盘校对（磁盘文件数、索引缺失、版本过期）与 FTS 完整性检查，较慢。
+    `deep=1` 额外校对（笔记比对磁盘、知识库比对归档 rev）与 FTS 完整性检查，较慢。
     """
     return search_index.stats(conn, notes_root, deep=bool(deep))
 
@@ -145,7 +145,7 @@ def api_reindex(
     conn: sqlite3.Connection = Depends(get_conn),
     notes_root: Path = Depends(get_notes_root),
 ) -> dict[str, Any]:
-    """同步重建全部索引（管理员）：例如迁移数据或改了知识库工作区后手动刷新。"""
+    """同步重建全部索引（管理员）：例如迁移数据或改了归档映射后手动刷新。"""
     require_admin(request)
     return {"ok": True, "indexed": search_index.reindex(conn, notes_root)}
 

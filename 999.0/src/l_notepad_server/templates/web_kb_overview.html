@@ -51,10 +51,7 @@
 {% endblock %}
 {% block appbar_sub %}知识库 · 多篇文章与目录层级{% endblock %}
 {% block appbar_actions %}
-          <form class="appbar-search" method="get" action="{{ web_base }}" role="search" aria-label="搜索全部知识库与笔记">
-            <span class="search-icon">🔍</span>
-            <input name="q" placeholder="搜索全部知识库/笔记内容…" aria-label="搜索" title="按回车全文检索（服务端倒排索引，含各知识库工作区）" />
-          </form>
+          {# 搜索框统一由 base.html 顶栏提供（全站可搜全部笔记 + 知识库） #}
 {% endblock %}
 {% block body %}
     <div class="wrap">

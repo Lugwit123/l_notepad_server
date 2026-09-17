@@ -114,7 +114,8 @@
       }
       @media (max-width: 700px) {
         .appbar-name { display: none; }
-        .appbar .search input { width: 130px; padding-right: 8px; }
+        .appbar .search input,
+        .appbar .appbar-search input { width: 130px; padding-right: 8px; }
       }
 
       /* 下拉浮层（导航 / 外观）：显隐只靠 .is-open 类，
@@ -239,7 +240,6 @@
         <div class="appbar-menu">
           <button type="button" id="app-nav-btn" class="appbar-btn" aria-expanded="false" aria-controls="app-nav-menu" title="导航菜单" onclick="return lnToggleAppbar(this)">☰</button>
           <div id="app-nav-menu" class="app-pop">
-            <a class="app-nav-item {% if _rel == '' %}active{% endif %}" href="{{ _mounted_url(request, '') }}"><span class="app-nav-ico">🏠</span>首页</a>
             <a class="app-nav-item {% if _rel == _web_rel %}active{% endif %}" href="{{ web_base }}"><span class="app-nav-ico">📋</span>笔记列表</a>
             <a class="app-nav-item {% if _rel == _web_rel + '/new' %}active{% endif %}" href="{{ web_base }}/new"><span class="app-nav-ico">✏️</span>新建笔记</a>
             <a class="app-nav-item {% if _rel == _kb_rel or _rel.startswith(_kb_rel + '/') %}active{% endif %}" href="{{ web_base }}/kb"><span class="app-nav-ico">📚</span>知识库</a>
@@ -253,14 +253,24 @@
             <a class="app-nav-item" href="{{ root_base }}/docs" target="_blank" rel="noopener"><span class="app-nav-ico">📘</span>API 文档</a>
           </div>
         </div>
-        <a class="appbar-brand" href="{{ _mounted_url(request, '') }}">
+        <a class="appbar-brand" href="{{ web_base }}">
           <span class="appbar-mark">N</span>
           <span class="appbar-name">L Notepad</span>
         </a>
         <span class="appbar-sub">{% block appbar_sub %}{% endblock %}</span>
       </div>
 
-      <div class="appbar-actions">{% block appbar_actions %}{% endblock %}</div>
+      <div class="appbar-actions">
+        {# 全站统一搜索框：任何页面（含「搜索索引」页）都能搜「全部笔记 + 所有知识库工作区」。
+           回车提交到 web_base（= /web）走服务端倒排索引检索；web_list 另绑即时标题过滤。 #}
+        <form class="appbar-search" method="get" action="{{ web_base }}" role="search" aria-label="搜索全部笔记与知识库">
+          <span class="search-icon">🔍</span>
+          <input id="global-search-input" name="q" value="{{ q|default('', true)|e }}"
+                 placeholder="搜索全部笔记 / 知识库…" aria-label="搜索" autocomplete="off"
+                 title="输入即弹窗显示命中（与「搜索索引」页同款结果）；回车看完整列表" />
+        </form>
+        {% block appbar_actions %}{% endblock %}
+      </div>
 
       <div class="appbar-right">
         <div class="appbar-menu">
@@ -293,6 +303,8 @@
           <button type="button" class="appbar-btn" onclick="doLogout()" title="退出登录">登出</button>
         </div>
       </div>
+      {# 搜索结果弹窗：挂在顶栏（.appbar 是 fixed 定位上下文）上，贴顶栏最左侧对齐 #}
+      <div class="search-pop" id="global-search-pop" role="listbox" aria-label="搜索结果"></div>
     </header>
     <script>
       /* 顶栏下拉菜单开合：内联实现，不依赖 external static/app.js。
@@ -359,6 +371,93 @@
         } else if (document.attachEvent) {
           document.attachEvent("onclick", onDocClick);
         }
+      })();
+    </script>
+    <script>
+      /* 顶栏搜索：输入即弹窗显示命中（结果样式复用 app.js 的 LN.renderSearchHits，
+         与「搜索索引」页完全一致）；回车仍走 GET 提交看完整列表。
+         与上面菜单脚本同样用 DOM0 级 API，避免老内核 / 旧 app.js 缓存问题。 */
+      (function () {
+        var input = document.getElementById("global-search-input");
+        var pop = document.getElementById("global-search-pop");
+        if (!input || !pop) return;
+        var root = "{{ root_base }}";
+        var webBase = "{{ web_base }}";
+        var timer = null, seq = 0;
+
+        function closePop() {
+          pop.className = "search-pop";
+          pop.innerHTML = "";
+        }
+        /* 宽度对齐页面内容栏（.wrap，即正文那一条），高度铺满顶栏以下；找不到就居中 */
+        function fitPop() {
+          var wrap = document.querySelector(".wrap");
+          if (wrap) {
+            var r = wrap.getBoundingClientRect();
+            pop.style.left = Math.round(r.left) + "px";
+            pop.style.width = Math.round(r.width) + "px";
+            pop.style.transform = "none";
+          } else {
+            pop.style.left = "50%";
+            pop.style.width = "";
+            pop.style.transform = "translateX(-50%)";
+          }
+        }
+        function render(d, q) {
+          var hits = (d && d.hits) || [];
+          var head = '<div class="search-pop-head">命中 ' + ((d && d.total) || hits.length) + " 条" +
+            (d && d.took_ms !== undefined ? " · " + Math.round(d.took_ms) + "ms" : "") +
+            '<a href="' + webBase + "?q=" + encodeURIComponent(q) + '">查看完整列表 →</a></div>';
+          var body = (window.LN && LN.renderSearchHits)
+            ? LN.renderSearchHits(hits)
+            : (hits.map(function (h) {
+                return '<div class="hit"><div class="hit-head"><a href="' + h.open_url + '">' +
+                  (h.source === "kb" ? "📚 " : "📝 ") + h.rel + "</a></div></div>";
+              }).join("") || '<div class="muted">无命中</div>');
+          pop.innerHTML = head + body;
+          fitPop();
+          pop.className = "search-pop is-open";
+        }
+        function run() {
+          var q = (input.value || "").trim();
+          if (!q) { closePop(); return; }
+          var my = ++seq;
+          fetch(root + "/api/search?q=" + encodeURIComponent(q) + "&limit=8&mode=lex",
+                { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(function (d) { if (my === seq) render(d, q); })
+            .catch(function (e) {
+              if (my !== seq) return;
+              pop.innerHTML = '<div class="pill bad">搜索失败：' + (e && e.message) + "</div>";
+              pop.className = "search-pop is-open";
+            });
+        }
+        function schedule() {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(run, 220);
+        }
+        function insideSearch(el) {
+          while (el && el !== document) {
+            var c = " " + (el.className || "") + " ";
+            if (c.indexOf(" appbar-search ") >= 0 || c.indexOf(" search-pop ") >= 0) return true;
+            el = el.parentNode;
+          }
+          return false;
+        }
+        input.addEventListener("input", schedule);
+        input.addEventListener("focus", function () { if (input.value.trim()) schedule(); });
+        window.addEventListener("resize", function () {
+          if (pop.className.indexOf("is-open") >= 0) fitPop();
+        });
+        input.addEventListener("keydown", function (ev) {
+          ev = ev || window.event;
+          if (ev.key === "Escape" || ev.keyCode === 27) closePop();
+          /* 回车不拦截：交给表单 GET 提交（完整列表页） */
+        });
+        document.addEventListener("click", function (ev) {
+          ev = ev || window.event;
+          if (!insideSearch(ev.target || ev.srcElement)) closePop();
+        }, false);
       })();
     </script>
     {% endif %}

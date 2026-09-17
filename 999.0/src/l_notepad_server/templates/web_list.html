@@ -586,10 +586,7 @@
 {% endblock %}
 {% block appbar_sub %}网页端日志中心{% endblock %}
 {% block appbar_actions %}
-          <form class="search" method="get" action="{{ web_base }}" role="search" aria-label="搜索笔记">
-            <span class="search-icon">🔍</span>
-            <input name="q" value="{{ q }}" placeholder="搜索标题或内容…" aria-label="搜索" title="输入时即时按标题过滤；按回车进行标题+正文全文检索（服务端倒排索引）" />
-          </form>
+          {# 搜索框统一由 base.html 顶栏提供（全站可搜全部笔记 + 知识库） #}
           <a class="btn primary" href="{{ web_base }}/new">新建</a>
 {% endblock %}
 {% block body %}
@@ -748,7 +745,7 @@
         });
 
         // ── 组合过滤：搜索 + 分组 + 标签 + 创建者 ──────────────
-        var searchInput = document.querySelector(".search input");
+        var searchInput = document.getElementById("global-search-input");
         // 服务端 ?q= 已经过滤过（含正文命中与知识库工作区文件），不能再用它做本地标题过滤，
         // 否则正文命中/工作区条目会被隐藏；用户再次输入不同关键词时才启用即时标题过滤。
         var serverQ = "{{ q|e }}";

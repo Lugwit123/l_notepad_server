@@ -157,12 +157,9 @@
         .actions { justify-content: space-between; }
       }
 {% endblock %}
-{% block appbar_sub %}{{ kb.title }} · 工作区笔记 · 版本库 {{ depot_base or ('/notes/' + kb.name) }}{% endblock %}
+{% block appbar_sub %}{{ kb.title }} · 归档文档 · 版本库 {{ depot_base or ('/notes/' + kb.name) }}{% endblock %}
 {% block appbar_actions %}
-          <form class="appbar-search" role="search" aria-label="搜索本知识库" onsubmit="return false;">
-            <span class="search-icon">🔍</span>
-            <input id="kb-search-input" placeholder="搜索本知识库内容…" aria-label="搜索" title="走倒排索引在本知识库工作区里检索；清空即回到文件树" />
-          </form>
+          {# 顶栏搜索框已由 base.html 提供（搜全部笔记 + 知识库）；本知识库的局部搜索在页内工具栏 #}
           <a class="btn" href="{{ web_base }}/kb">← 知识库</a>
 {% endblock %}
 {% block body %}
@@ -170,12 +167,12 @@
       <div class="ws-panel" id="ws-panel">
         <aside class="sidebar">
           <div class="sidebar-head">
-            <div class="sidebar-title">工作区笔记</div>
+            <div class="sidebar-title">归档文档</div>
             <div class="sidebar-meta" id="ws-meta">加载中…</div>
           </div>
           <div class="side-scroll">
             <div class="side-section">
-              <div class="side-h">本机工作区 + 云端</div>
+              <div class="side-h">版本库归档（已上传）</div>
               <div class="cat-tree" id="ws-tree"></div>
             </div>
           </div>
@@ -183,11 +180,19 @@
         <main class="content">
           <div class="content-header">
             <div class="content-header-left">
-              <h2 id="ws-title">工作区笔记</h2>
-              <p id="ws-sub">选择左侧笔记预览</p>
+              <h2 id="ws-title">归档文档</h2>
+              <p id="ws-sub">选择左侧归档文档预览</p>
             </div>
             <div class="article-actions">
-              <button class="btn sm primary" type="button" id="btn-ws-upload">➕ 上传本地文件</button>
+              <span style="position:relative;display:inline-flex;align-items:center;">
+                <span style="position:absolute;left:9px;color:var(--muted);font-size:12px;pointer-events:none;">🔍</span>
+                <input id="kb-search-input" placeholder="搜索本知识库…" aria-label="搜索本知识库"
+                       title="走倒排索引在本知识库工作区里检索；清空即回到文件树"
+                       style="width:180px;background:rgba(8,12,26,0.80);border:1px solid var(--border);border-radius:9px;padding:6px 10px 6px 28px;color:var(--text);outline:none;font-size:12px;" />
+              </span>
+              <button class="btn sm primary" type="button" id="btn-ws-upload-all"
+                      title="把工作区里「归档中没有」或「大小有变化」的文档批量提交到版本库归档（上传后自动重建本知识库索引）">⬆⬆ 一键上传</button>
+              <button class="btn sm" type="button" id="btn-ws-upload">➕ 上传本地文件</button>
               <button class="btn sm" type="button" id="btn-ws-set">设置工作区</button>
               <button class="btn sm" type="button" id="tray-state" title="托盘连接状态（点击看详情）">🔌 托盘：探测中…</button>
               <button class="btn sm" type="button" id="btn-depot" title="版本库归档位置（点击可改库内子路径）">归档：…</button>
@@ -197,7 +202,7 @@
           </div>
           <div class="reader">
             <div class="reader-head">
-              <div class="reader-title" id="ws-reader-title">选择工作区笔记</div>
+              <div class="reader-title" id="ws-reader-title">选择归档文档</div>
               <div class="reader-meta" id="ws-reader-meta"></div>
             </div>
             <div class="reader-body">
@@ -282,6 +287,8 @@
               trayInfo.error = "";
               trayReady = actions.indexOf("kb_ws_list") !== -1;
               trayInfo.ready = trayReady;
+              // 版本库(depot)中转能力：托盘注册了 depot_download 才把归档读取交给它
+              trayInfo.depotReady = actions.indexOf("depot_download") !== -1;
             })
             .catch(function (e) {
               trayReady = false;
@@ -296,8 +303,16 @@
               if (trayReady) {
                 trayCall("kb_ws_roots", {}, 3000)
                   .then(function (d) { trayInfo.roots = (d && d.roots) || []; })
-                  .catch(function () { trayInfo.roots = []; })
-                  .finally(function () { renderTrayState(); if (cb) cb(); });
+                  .catch(function () { trayInfo.roots = []; });
+                if (trayInfo.depotReady) {
+                  trayCall("depot_base", {}, 3000)
+                    .then(function (d) { trayInfo.depotBase = (d && d.base_url) || ""; })
+                    .catch(function () { trayInfo.depotBase = ""; })
+                    .finally(function () { renderTrayState(); if (cb) cb(); });
+                  return;
+                }
+                renderTrayState();
+                if (cb) cb();
                 return;
               }
               renderTrayState();
@@ -384,10 +399,11 @@
 
         function loadCloudStatus(cb) {
           cloudMap = {};
-          api("/api/kb/" + encodeURIComponent(kbName) + "/depot/list")
+          // 递归列归档：知识库文件树与索引的权威来源 = 已上传到 depot 的内容
+          api("/api/kb/" + encodeURIComponent(kbName) + "/depot/list?recursive=1")
             .then(function (j) {
-              (j.items || []).forEach(function (i) {
-                if (i.isdir) return;   // 目录层级由本地/归档条目自身路径体现
+              (j.files || j.items || []).forEach(function (i) {
+                if (i.isdir) return;   // 目录层级由条目自身路径体现
                 cloudMap[i.rel] = { rev: i.rev, path: i.path, remote_path: i.remote_path || "", size: i.size };
               });
               cb && cb();
@@ -524,7 +540,7 @@
           wsTree.textContent = "";
           const rels = Object.keys(statusMap).sort();
           if (!rels.length) {
-            wsTree.innerHTML = '<div class="reader-empty">暂无笔记<br>点击右上角「上传本地文件」或设置工作区</div>';
+            wsTree.innerHTML = '<div class="reader-empty">归档里还没有文档<br>把工作区文档「提交为新版本」后即出现在这里</div>';
             return;
           }
           renderWsNode(buildWsTree(rels), 0);
@@ -559,14 +575,24 @@
             });
             return;
           }
+          // 服务端模式：文件树 = 归档里「已上传」的内容（不读任何本机工作区目录）
+          // 全部按「云端只读」处理：不做本机/云端逐篇内容比对（省掉 N 次往返）
           loadCloudStatus(function () {
-            api("/api/kb/" + kbName + "/workspace").then(function (r) {
-              wsPath = r.workspace || "";
-              wsFiles = r.files || [];
-              sharedMap = {};
-              (wsFiles || []).forEach(function (f) { if (f.shared) sharedMap[f.rel] = true; });
-              done();
-            }).catch(function () {});
+            wsFiles = Object.keys(cloudMap).sort().map(function (rel) {
+              return {
+                rel: rel,
+                name: rel.split("/").pop(),
+                size: cloudMap[rel].size,
+                mtime: 0,
+                shared: false
+              };
+            });
+            wsPath = (depotInfo && depotInfo.base_path) || ("/notes/" + kbName);
+            sharedMap = {};
+            statusMap = {};
+            wsFiles.forEach(function (f) { statusMap[f.rel] = { cloudOnly: true }; });
+            renderWsTree();
+            if (cb) cb();
           });
         }
 
@@ -601,10 +627,40 @@
           }
           fetchCloud();
           function fetchCloud() {
-            fetch("/baidu/api/depot/download?path=" + encodeURIComponent("/" + kbName + "/" + rel) + "&rev=0")
+            // 归档逻辑路径 = {库}/{子路径}/{rel}，取自归档映射 base_path（如 /notes/rez_pkg）；
+            // 映射还没拿到时退回默认库 /notes + 知识库名。
+            const depotRel = (depotInfo && depotInfo.base_path)
+              ? depotInfo.base_path.replace(/\/+$/, "") + "/" + rel
+              : "/notes/" + kbName + "/" + rel;
+            // 内容获取优先级：客户端本地桥 → 托盘中转 → /baidu 直连 → 知识库后端（服务端读归档）
+            if (bridgeDepotReady()) {
+              bridgeDepotDownload(depotRel,
+                function (d) {
+                  if (typeof d.text === "string") { render(d.text, cloudMeta); return; }
+                  toast("该归档文件为二进制，无法在线预览（" + (d.size || 0) + " 字节）", "error");
+                },
+                function (e) { toast("读取失败（客户端）：" + e.message, "error"); });
+              return;
+            }
+            if (useTrayDepot()) {
+              trayCall("depot_download", { path: depotRel, rev: 0 })
+                .then(function (d) {
+                  if (typeof d.text === "string") { render(d.text, cloudMeta); return; }
+                  toast("该归档文件为二进制，无法在线预览（" + (d.size || 0) + " 字节）", "error");
+                })
+                .catch(function (e) { toast("读取失败（托盘）：" + e.message, "error"); });
+              return;
+            }
+            fetch("/baidu/api/depot/download?path=" + encodeURIComponent(depotRel) + "&rev=0")
               .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
               .then(function (text) { render(text, cloudMeta); })
-              .catch(function (e) { toast("读取失败：" + e.message, "error"); });
+              .catch(function () {
+                const rev = cloud ? cloud.rev : 0;
+                return getCloudContent(rel).then(function (text) {
+                  if (text) { render(text, "版本 #" + rev + " · 服务端读取"); return; }
+                  toast("读取失败：归档内容不可用（rev #" + rev + "）", "error");
+                });
+              });
           }
         }
 
@@ -694,26 +750,111 @@
         }
         document.getElementById("btn-ws-submit").addEventListener("click", function () { submitToBaidu(wsActiveRel); });
 
-        document.getElementById("btn-ws-upload").addEventListener("click", function () {
-          if (!wsFiles.length) { toast("请先设置工作区（工作区需有 .md 文档）", "error"); return; }
-          const local = wsFiles.filter(function (f) {
-            const st = statusMap[f.rel] || {};
-            if (st.localOnly || st.modified) return true;
-            // 状态尚未算出（reconcileStatus 重算期间 statusMap 会短暂清空）：
-            // 归档里没有该文件就当作待上传
-            return Object.keys(st).length === 0 && !cloudMap[f.rel];
-          });
-          if (!local.length) {
-            toast("所有本地文档均已同步到云端，无需上传", "info");
-            return;
+        // ── 工作区文件清单（本机模式走托盘，服务端模式走 /workspace），一键上传用 ──
+        function wsListAll() {
+          if (useLocal()) {
+            if (!wsRoot) return Promise.reject(new Error("请先选择本机目录"));
+            return trayCall("kb_ws_list", { root: wsRoot }).then(function (d) {
+              return (d.files || []).map(function (f) { return { rel: f.rel, size: f.size }; });
+            });
           }
-          const msg = "选择要上传的本地文件（仅本地或已修改）：\n\n" +
-            local.map(function (f, i) { return (i + 1) + ". " + f.rel; }).join("\n") +
-            "\n\n输入编号：";
-          const input = prompt(msg, "1");
-          const idx = parseInt(input, 10) - 1;
-          if (isNaN(idx) || idx < 0 || idx >= local.length) return;
-          submitToBaidu(local[idx].rel);
+          return api("/api/kb/" + encodeURIComponent(kbName) + "/workspace").then(function (r) {
+            return (r.files || []).map(function (f) { return { rel: f.rel, size: f.size }; });
+          });
+        }
+
+        // 待上传 = 归档里没有的 + 归档里字节数不同的（已变更）；用大小做廉价比对，不逐篇拉内容
+        function pendingUploadRels(files) {
+          return files.filter(function (f) {
+            const cloud = cloudMap[f.rel];
+            if (!cloud) return true;
+            return Number(cloud.size || 0) !== Number(f.size || 0);
+          }).map(function (f) { return f.rel; });
+        }
+
+        function submitArchive(rel, description) {
+          return getLocalContent(rel).then(function (content) {
+            return fetch(root + "/api/kb/" + encodeURIComponent(kbName) + "/depot/submit?rel=" +
+                         encodeURIComponent(rel) + "&description=" +
+                         encodeURIComponent(description || ("上传 " + rel)), {
+              method: "POST",
+              headers: { "Content-Type": "application/octet-stream" },
+              body: content
+            }).then(function (resp) {
+              if (!resp.ok) {
+                return resp.text().then(function (t) { throw new Error("HTTP " + resp.status + " " + t); });
+              }
+              return resp.json();
+            });
+          });
+        }
+
+        // 顺序逐个提交（按钮上显示进度，结尾汇总）；后端每次提交后即时重建本知识库索引
+        function uploadWorkspaceRels(rels, btn) {
+          const total = rels.length;
+          const queue = rels.slice();
+          const failed = [];
+          let sent = 0;
+          btn.dataset.busy = "1";
+          const step = function () {
+            if (!queue.length) {
+              btn.dataset.busy = "0";
+              btn.textContent = btn.dataset.label;
+              if (failed.length) {
+                toast("上传完成：成功 " + (total - failed.length) + " · 失败 " + failed.length +
+                      "（首个失败：" + failed[0] + "）", "error");
+              } else {
+                toast("已上传 " + total + " 个文档到版本库 ✓");
+              }
+              loadDepotMapping().then(loadWorkspace);
+              return;
+            }
+            const rel = queue.shift();
+            sent += 1;
+            btn.textContent = "上传中 " + sent + "/" + total;
+            submitArchive(rel, "一键上传 " + rel)
+              .catch(function () { failed.push(rel); })
+              .then(step);
+          };
+          step();
+        }
+
+        document.getElementById("btn-ws-upload-all").addEventListener("click", function () {
+          const btn = this;
+          if (btn.dataset.busy === "1") return;
+          btn.dataset.label = btn.dataset.label || btn.textContent;
+          wsListAll().then(function (files) {
+            if (!files.length) {
+              toast("工作区没有可上传的文档（未配置工作区或目录为空）", "info");
+              return;
+            }
+            const rels = pendingUploadRels(files);
+            if (!rels.length) { toast("工作区文档均已上传，无需上传", "info"); return; }
+            const preview = rels.slice(0, 8).map(function (r, i) { return (i + 1) + ". " + r; }).join("\n");
+            if (!confirm("一键上传 " + rels.length + " 个工作区文档到版本库归档？\n\n" + preview +
+                         (rels.length > 8 ? "\n…（共 " + rels.length + " 个）" : ""))) return;
+            uploadWorkspaceRels(rels, btn);
+          }).catch(function (e) { toast("读取工作区失败：" + e.message, "error"); });
+        });
+
+        document.getElementById("btn-ws-upload").addEventListener("click", function () {
+          wsListAll().then(function (files) {
+            if (!files.length) {
+              toast("工作区没有可上传的文档（未配置工作区或目录为空）", "info");
+              return;
+            }
+            const rels = pendingUploadRels(files);
+            if (!rels.length) { toast("工作区文档均已上传，无需上传", "info"); return; }
+            const msg = "选择要上传的文档（归档缺失或已变更）：\n\n" +
+              rels.map(function (r, i) { return (i + 1) + ". " + r; }).join("\n") +
+              "\n\n输入编号：";
+            const idx = parseInt(prompt(msg, "1"), 10) - 1;
+            if (isNaN(idx) || idx < 0 || idx >= rels.length) return;
+            submitArchive(rels[idx], "提交 " + rels[idx]).then(function () {
+              toast("已提交到版本库 ✓");
+              loadCloudStatus(function () { loadWorkspace(); });
+            }).catch(function (e) { toast("提交失败：" + e.message, "error"); });
+          }).catch(function (e) { toast("读取工作区失败：" + e.message, "error"); });
         });
 
         document.getElementById("btn-ws-set").addEventListener("click", function () {
@@ -818,12 +959,40 @@
         }
 
         // 托盘连接信息（显示在「🔌 托盘」按钮上，点击看详情）
-        let trayInfo = { ready: false, url: TRAY_URL, actions: [], error: "", ms: 0, roots: [] };
+        let trayInfo = { ready: false, url: TRAY_URL, actions: [], error: "", ms: 0, roots: [],
+                         depotReady: false, depotBase: "" };
 
         function trayModeText() {
           if (useLocal()) return "本机模式（经托盘读写浏览器所在机器的磁盘）";
           if (trayInfo.ready) return "服务端模式（托盘在线，但本知识库未授权本机目录）";
           return "服务端模式（读服务器磁盘上的工作区目录）";
+        }
+
+        /* 归档（版本库）内容是否经托盘中转：托盘提供 depot_download 动作才走 */
+        function useTrayDepot() { return trayInfo.ready && trayInfo.depotReady; }
+
+        /* ── 客户端本地桥（QWebChannel）────────────────────────────
+           lugwit_netdisk_client 里跑本页时会注入 window.lugwitBridge（含 depot* 槽），
+           此时版本库内容直接**本地取**，最快且不依赖托盘 / nginx /baidu 网关。 */
+        function bridgeDepotReady() {
+          return !!(window.lugwitBridge && typeof window.lugwitBridge.depotDownload === "function");
+        }
+
+        function bridgeDepotDownload(path, onOk, onErr) {
+          try {
+            window.lugwitBridge.depotDownload(path, 0, function (raw) {
+              let d = {};
+              try { d = JSON.parse(raw || "{}"); } catch (e) { d = {}; }
+              if (d && d.ok) onOk(d); else onErr(new Error((d && d.error) || "客户端读取失败"));
+            });
+          } catch (e) { onErr(e); }
+        }
+
+        /* 版本库读取来源描述（浮层显示用） */
+        function depotSourceText() {
+          if (bridgeDepotReady()) return "客户端本地桥（lugwit_netdisk_client 进程内直连 depot 服务）";
+          if (useTrayDepot()) return "经托盘中转（" + (trayInfo.depotBase || "基址未知") + "）";
+          return "回退 /baidu 直连";
         }
 
         function renderTrayState() {
@@ -838,6 +1007,7 @@
               ? "已连接（" + trayInfo.ms + "ms，白名单动作 " + trayInfo.actions.length + " 个）"
               : "未连接" + (trayInfo.error ? "：" + trayInfo.error : "")),
             "模式：" + trayModeText(),
+            "版本库读取：" + depotSourceText(),
             "本知识库授权目录：" + (wsRoot || "（未授权，点「选择本机目录」授权）"),
             "托盘已授权目录（" + roots.length + "）：" + (roots.length ? roots.join("\n") : "（无）"),
           ].join("\n");

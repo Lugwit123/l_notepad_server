@@ -37,38 +37,7 @@
         border-radius: 8px; color: var(--text); font-size: 12px; padding: 7px 10px; outline: none;
       }
       input.q:focus { border-color: var(--accent-border); }
-      #hits { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
-      .hit {
-        border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px;
-        background: rgba(255,255,255,0.02); font-size: 12px;
-      }
-      .hit.hot { border-color: rgba(110,231,168,0.35); background: rgba(110,231,168,0.05); }
-      .hit-head { display: flex; align-items: center; gap: 8px; }
-      .hit-head a { color: var(--accent-bright); text-decoration: none; font-weight: 600; }
-      .badge-score {
-        margin-left: auto; flex-shrink: 0;
-        padding: 2px 10px; border-radius: 20px; font-weight: 700; font-size: 13px;
-        color: #0b1120; background: linear-gradient(180deg, #7cfc9a, #35c97a);
-      }
-      .hit .snip { color: var(--muted); margin-top: 5px; line-height: 1.55; }
-      .signals { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 7px; }
-      .sig {
-        display: inline-flex; align-items: center; gap: 5px;
-        padding: 2px 9px; border-radius: 20px; font-size: 11px; color: var(--muted);
-        border: 1px solid var(--border); background: rgba(255,255,255,0.03);
-      }
-      .sig b { color: var(--accent-bright); font-size: 12px; }
-      .sig.main { border-color: var(--accent-border); }
-      .sig.hot-sig { border-color: rgba(110,231,168,0.5); color: #9df0bd; }
-      .sig.dim { opacity: 0.55; }
-      .sig .mini {
-        display: block; width: 42px; height: 6px; border-radius: 4px;
-        background: rgba(255,255,255,0.10); overflow: hidden;
-      }
-      .sig .mini s { display: block; height: 100%; width: 0; text-decoration: none; }
-      .sig .mini.cov s { background: linear-gradient(90deg, #5b9cff, #7cfc9a); }
-      .sig .mini.prox s { background: linear-gradient(90deg, #fbbf24, #7cfc9a); }
-      .sig.when { font-family: Consolas, Menlo, monospace; }
+      /* .hit / .sig / #hits 等结果样式已抽到 static/app.css（与顶栏搜索弹窗共用） */
 {% endblock %}
 {% block appbar_sub %}搜索索引状态与进度{% endblock %}
 {% block appbar_actions %}
@@ -176,9 +145,11 @@
           html += kpi("索引文档", d.docs, "笔记 " + noteDocs + " · 知识库 " + kbDocs);
           html += kpi("倒排行数", d.fts_rows, d.fts_consistent ? "与文档表一致" : "与文档表不一致！");
           html += kpi("索引体积", fmtBytes(d.db_bytes), "含 FTS5 倒排与原文");
-          html += kpi("待处理队列", d.pending, "服务内变更待补索引");
+          html += kpi("待处理队列", d.pending,
+            "服务内变更待补索引" + ((d.kb_pending || []).length ? " · 归档待同步 " + d.kb_pending.length + " 库" : ""));
           html += kpi("扫描间隔", d.scan_ttl_s + "s",
-            d.last_scan_ago == null ? "本进程尚未扫描" : "上次扫描 " + d.last_scan_ago + "s 前");
+            (d.last_scan_ago == null ? "本进程尚未扫描" : "上次扫描 " + d.last_scan_ago + "s 前") +
+            " · 归档兜底 " + (d.kb_scan_ttl_s || "?") + "s");
           html += kpi("单文件上限", fmtBytes(d.max_index_bytes), "超出部分不参与检索");
           if (d.deep) {
             const miss = (d.sources || []).reduce(function (a, s) { return a + (s.missing || 0); }, 0);
@@ -199,17 +170,20 @@
               : "";
             return "<tr><td>" + (s.source === "kb" ? "📚 知识库 <b>" + esc(s.kb_name) + "</b>" : "📝 个人笔记") +
               '</td><td class="mono">' + esc(s.root) +
-              (s.exists ? "" : ' <span class="pill bad">目录不存在</span>') + "</td><td>" + s.docs +
+              (s.exists ? "" : ' <span class="pill bad">目录不存在</span>') +
+              (s.error ? ' <span class="pill bad">' + esc(s.error) + "</span>" : "") + "</td><td>" + s.docs +
               "</td><td>" + fmtBytes(s.bytes) + "</td><td>" + esc(s.last_indexed_at || "—") +
               (s.newest_mtime ? '<div class="muted">最新内容 ' + esc(s.newest_mtime) + "</div>" : "") +
+              (s.last_sync_ago != null ? '<div class="muted">归档同步 ' + s.last_sync_ago + "s 前</div>" : "") +
               "</td>" + (d.deep ? "<td>" + verified + "</td>" : "") + "</tr>";
           }).join("");
           document.getElementById("src-rows").innerHTML =
             rows || '<tr><td colspan="6" class="muted">尚无索引内容</td></tr>';
           document.getElementById("th-verify").style.display = d.deep ? "" : "none";
           document.getElementById("src-note").textContent =
-            "索引源 = 笔记目录 + 各知识库工作区（" + (d.workspace_exts || []).join(" / ") + "）；" +
-            "内容未变的文件不会重读。";
+            "索引源 = 笔记目录（本机文件）+ 各知识库归档（depot 已上传内容，" +
+            (d.workspace_exts || []).join(" / ") + "）；工作区本机目录不参与索引，" +
+            "上传/提交后即时重建，另有 " + (d.kb_scan_ttl_s || "?") + "s 兜底扫描。";
         }
 
         function renderProgress(d) {
@@ -388,67 +362,11 @@
               document.getElementById("search-info").textContent =
                 "命中 " + d.total + " 条 · " + d.took_ms + "ms" + (d.fallback ? " · 精确短语无结果，已模糊匹配" : "") +
                 (v.used ? " · 语义命中 " + v.hits + "（" + (v.model || "") + "）" : "");
-              box.innerHTML = (d.hits || []).map(function (h) {
-                const num = function (v, d) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(d); };
-                const pct = function (v) { return (v === null || v === undefined) ? 0 : Math.round(v * 100); };
-                const sig = function (label, value, tip, extra) {
-                  return '<span class="sig' + (extra || "") + '" title="' + esc(tip || "") + '">' +
-                    label + " <b>" + value + "</b></span>";
-                };
-                const bar = function (v, cls) {
-                  return '<i class="mini' + (cls || "") + '"><s style="width:' + pct(v) + '%"></s></i>';
-                };
-                // 命中词高亮：先转义，再按位置区间套 <mark>（相邻/重叠合并）
-                const hl = function (text, terms) {
-                  const safe = esc(text);
-                  const low = safe.toLowerCase();
-                  const spans = [];
-                  (terms || []).slice().sort(function (a, b) { return b.length - a.length; })
-                    .forEach(function (t) {
-                      const needle = esc(t).toLowerCase();
-                      if (!needle) return;
-                      let from = 0;
-                      while (spans.length < 200) {
-                        const p = low.indexOf(needle, from);
-                        if (p < 0) break;
-                        spans.push([p, p + needle.length]);
-                        from = p + 1;
-                      }
-                    });
-                  if (!spans.length) return safe;
-                  spans.sort(function (a, b) { return a[0] - b[0]; });
-                  const merged = [];
-                  spans.forEach(function (s) {
-                    const last = merged[merged.length - 1];
-                    if (last && s[0] <= last[1]) last[1] = Math.max(last[1], s[1]);
-                    else merged.push([s[0], s[1]]);
-                  });
-                  let out = "", at = 0;
-                  merged.forEach(function (s) {
-                    out += safe.slice(at, s[0]) + "<mark>" + safe.slice(s[0], s[1]) + "</mark>";
-                    at = s[1];
-                  });
-                  return out + safe.slice(at);
-                };
-                const hot = (h.phrase_hits || 0) > 0;
-                return '<div class="hit' + (hot ? " hot" : "") + '">' +
-                  '<div class="hit-head"><a href="' + esc(h.open_url) + '">' +
-                  (h.source === "kb" ? "📚 " : "📝 ") + esc(h.rel) + "</a>" +
-                  '<span class="badge-score" title="综合相关度：3×短语 + 2×覆盖率 + 词频 + 近邻 − 1.5×bm25">' +
-                  num(h.score, 2) + "</span></div>" +
-                  '<div class="snip">' + hl(h.snippet, h.matches) + "</div>" +
-                  '<div class="signals">' +
-                  (hot ? '<span class="sig hot-sig" title="引号短语精确命中次数">短语 <b>' + h.phrase_hits + "</b></span>" : "") +
-                  '<span class="sig main" title="查询词块有多少出现在本文（越高越好）">覆盖 <b>' + pct(h.coverage) + "%</b>" +
-                  bar(h.coverage, " cov") + "</span>" +
-                  '<span class="sig main" title="命中词块相近程度：1.0 最集中（200 字符内）">近邻 <b>' + num(h.proximity, 2) + "</b>" +
-                  bar(h.proximity, " prox") + "</span>" +
-                  (h.vec ? '<span class="sig main" title="向量语义相似度（余弦）">语义 <b>' + num(h.vec, 3) + "</b></span>" : "") +
-                  sig("词频", num(h.tf, 2), "词块出现次数加权（单块封顶 5 次）", " dim") +
-                  sig("bm25", num(h.bm25, 2), "倒排引擎原始分（越负越相关，取负后计入总分）", " dim") +
-                  '<span class="sig dim when">' + esc((h.updated_at || "").replace("T", " ").slice(0, 16)) + "</span>" +
-                  "</div></div>";
-              }).join("") || '<div class="muted">无命中</div>';
+              /* 结果渲染交给 static/app.js 的 LN.renderSearchHits：
+                 与顶栏搜索弹窗共用同一份，样式/字段完全一致 */
+              box.innerHTML = (window.LN && LN.renderSearchHits)
+                ? LN.renderSearchHits(d.hits)
+                : '<div class="pill bad">结果渲染器 app.js 未加载</div>';
             })
             .catch(function (e) { box.innerHTML = '<div class="pill bad">搜索失败：' + esc(e.message) + "</div>"; });
         }

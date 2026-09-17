@@ -264,6 +264,8 @@ def api_kb_depot_save(
         )
     except depot_map.DepotError as exc:
         raise _depot_error(exc) from exc
+    # 归档基路径变了 → 旧索引里的 rel 全部失效，后台按新映射重同步该库
+    search_index.notify_kb_change(kb_name)
     return {"ok": True, **info}
 
 
@@ -272,9 +274,12 @@ def api_kb_depot_list(
     kb_name: str,
     conn: sqlite3.Connection = Depends(get_conn),
     rel: str = "",
+    recursive: int = 0,
 ) -> dict[str, Any]:
-    """列出知识库归档子路径下的内容（默认归档根）。"""
+    """列出知识库归档子路径下的内容（默认归档根；recursive=1 递归列全部文件）。"""
     try:
+        if recursive:
+            return {"ok": True, **depot_map.list_tree(conn, kb_name)}
         return {"ok": True, **depot_map.list_dir(conn, kb_name, rel=rel)}
     except depot_map.DepotError as exc:
         raise _depot_error(exc) from exc
@@ -306,10 +311,12 @@ async def api_kb_depot_submit(
     """把内容提交为知识库归档文件的新版本（body = 原始文本）。"""
     raw = await request.body()
     try:
-        return {"ok": True, **depot_map.submit_file(
-            conn, kb_name, rel=rel, content=raw, description=description)}
+        result = depot_map.submit_file(
+            conn, kb_name, rel=rel, content=raw, description=description)
     except depot_map.DepotError as exc:
         raise _depot_error(exc) from exc
+    search_index.notify_kb_change(kb_name)   # 归档变了 → 后台即时重索引该库
+    return {"ok": True, **result}
 
 
 @router.get("/api/kb/{kb_name}/search")
@@ -438,6 +445,7 @@ def api_kb_publish(
     )
     if ws_rel:
         _depot_upload_content(conn, kb_name, ws_rel, note.content, payload.note_path)
+        search_index.notify_kb_change(kb_name)   # 归档新增/更新 → 后台即时重索引
     return {"ok": True, "article": kb.get_article(conn, kb_name, payload.note_path)}
 
 

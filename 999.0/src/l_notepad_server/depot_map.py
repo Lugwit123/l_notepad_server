@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from . import knowledge as kbmod
@@ -45,6 +46,32 @@ def base_url() -> str:
     return os.environ.get("L_DEPOT_SERVICE_URL", "http://127.0.0.1:1028").strip().rstrip("/")
 
 
+# ── 登录态 ──────────────────────────────────────────────
+# depot 服务（1028）每个请求都过 lugwit_auth 闸门（认 cookie lugwit_token / Bearer）。
+# 服务自带的「本机自动授权」实测会静默失败（访问日志只见 401），所以这里主动取：
+#   环境变量 LUGWIT_ACCESS_TOKEN > lugwit_auth 本机自动授权端点（同机部署时可用）
+_AUTH_URL = os.environ.get("LUGWIT_AUTH_URL", "http://127.0.0.1:1027").strip().rstrip("/")
+_token_cache = {"value": ""}
+
+
+def _auto_token() -> str:
+    try:
+        req = urllib.request.Request(_AUTH_URL + "/api/v1/auth/auto", method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return str(json.loads(resp.read().decode("utf-8")).get("access_token") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _token(force: bool = False) -> str:
+    env = os.environ.get("LUGWIT_ACCESS_TOKEN", "").strip()
+    if env:
+        return env
+    if force or not _token_cache["value"]:
+        _token_cache["value"] = _auto_token()
+    return _token_cache["value"]
+
+
 def http(
     method: str,
     path: str,
@@ -53,8 +80,12 @@ def http(
     body: bytes | None = None,
     json_body: dict[str, Any] | None = None,
     timeout: float = 60.0,
+    _retry_auth: bool = True,
 ) -> tuple[int, bytes]:
-    """调用 depot HTTP 接口，返回 (status, raw)；网络异常抛 DepotError。"""
+    """调用 depot HTTP 接口，返回 (status, raw)；网络异常抛 DepotError。
+
+    自动带上 lugwit 登录态（cookie + Bearer）；收到 401 时换新 token 重试一次。
+    """
     url = base_url() + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -65,12 +96,20 @@ def http(
         headers["Content-Type"] = "application/json"
     elif body is not None:
         headers["Content-Type"] = "application/octet-stream"
+    tok = _token()
+    if tok:
+        headers["Cookie"] = "lugwit_token=" + tok
+        headers["Authorization"] = "Bearer " + tok
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        raw = exc.read()
+        if exc.code == 401 and _retry_auth and _token(force=True):
+            return http(method, path, params=params, body=body, json_body=json_body,
+                        timeout=timeout, _retry_auth=False)
+        return exc.code, raw
     except Exception as exc:  # noqa: BLE001
         raise DepotError(f"版本库服务不可用：{exc}") from exc
 
@@ -193,13 +232,12 @@ def upload_content(conn: sqlite3.Connection, kb_name: str, rel: str, content: st
     return True
 
 
-def list_dir(conn: sqlite3.Connection, kb_name: str, *, rel: str = "") -> dict[str, Any]:
-    """列出知识库归档子路径下的内容（默认根）。"""
-    info = ensure_workspace(conn, kb_name)
-    dpath = info["base_path"] if not rel.strip() else depot_path(info, rel)
+def _list_once(info: dict[str, Any], rel: str, ws_id: int) -> list[dict[str, Any]]:
+    """列归档某一层目录（path 已折算成相对 base_path 的 rel）。"""
+    dpath = info["base_path"] if not str(rel or "").strip() else depot_path(info, rel)
     params = {"dir": dpath}
-    if info.get("ws_id"):
-        params["ws"] = str(info["ws_id"])
+    if ws_id:
+        params["ws"] = str(ws_id)
     status, raw = http("GET", "/api/depot/list", params=params)
     if status >= 400:
         raise DepotError(f"列目录失败：HTTP {status} {raw[:200]!r}")
@@ -210,7 +248,51 @@ def list_dir(conn: sqlite3.Connection, kb_name: str, *, rel: str = "") -> dict[s
         path = str(it.get("path") or "")
         rel_path = path[len(prefix):].lstrip("/") if path.startswith(prefix) else path.lstrip("/")
         items.append({**it, "rel": rel_path})
-    return {"mapping": info, "dir": dpath, "items": items}
+    return items
+
+
+def list_dir(conn: sqlite3.Connection, kb_name: str, *, rel: str = "") -> dict[str, Any]:
+    """列出知识库归档子路径下的内容（默认根）。"""
+    info = ensure_workspace(conn, kb_name)
+    dpath = info["base_path"] if not str(rel or "").strip() else depot_path(info, rel)
+    return {"mapping": info, "dir": dpath, "items": _list_once(info, rel, int(info.get("ws_id") or 0))}
+
+
+# 递归列目录的目录数上限（异常目录结构不至于把一次同步拖成大量请求）
+MAX_TREE_DIRS = 200
+
+
+def list_tree(conn: sqlite3.Connection, kb_name: str, *, exts: set[str] | None = None) -> dict[str, Any]:
+    """递归列出知识库归档内的全部文件（**已上传的服务端内容**，不读本机工作区）。
+
+    返回 {"mapping": info, "files": [{rel, path, name, size, rev}]}，按 rel 排序。
+    `exts` 非空时只保留这些扩展名（与可预览文本类型一致）。
+    """
+    info = ensure_workspace(conn, kb_name)
+    ws_id = int(info.get("ws_id") or 0)
+    queue = [""]
+    dirs_done = 0
+    files: list[dict[str, Any]] = []
+    while queue:
+        rel = queue.pop(0)
+        for it in _list_once(info, rel, ws_id):
+            child = str(it.get("rel") or "")
+            if it.get("isdir"):
+                if dirs_done < MAX_TREE_DIRS:
+                    queue.append(child)
+                    dirs_done += 1
+                continue
+            if exts is not None and Path(child).suffix.lower() not in exts:
+                continue
+            files.append({
+                "rel": child,
+                "path": str(it.get("path") or ""),
+                "name": str(it.get("name") or Path(child).name),
+                "size": int(it.get("size") or 0),
+                "rev": int(it.get("rev") or 0),
+            })
+    files.sort(key=lambda f: str(f["rel"]).lower())
+    return {"mapping": info, "files": files}
 
 
 def read_file(conn: sqlite3.Connection, kb_name: str, *, rel: str, rev: int = 0) -> bytes:
@@ -223,6 +305,15 @@ def read_file(conn: sqlite3.Connection, kb_name: str, *, rel: str, rev: int = 0)
     if status >= 400:
         raise DepotError(f"读取失败：HTTP {status} {raw[:200]!r}")
     return raw
+
+
+def read_text(conn: sqlite3.Connection, kb_name: str, *, rel: str, rev: int = 0,
+              max_bytes: int = 0) -> str:
+    """读取归档文件内容并按 UTF-8 解码（max_bytes 非 0 时只取前 N 字节）。"""
+    raw = read_file(conn, kb_name, rel=rel, rev=rev)
+    if max_bytes and len(raw) > max_bytes:
+        raw = raw[:max_bytes]
+    return raw.decode("utf-8", "replace")
 
 
 def submit_file(conn: sqlite3.Connection, kb_name: str, *, rel: str, content: bytes,

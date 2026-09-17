@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""笔记/知识库工作区的向量语义检索（本机 Ollama embedding + SQLite 存向量）
+"""笔记 / 知识库归档的向量语义检索（本机 Ollama embedding + SQLite 存向量）
 
 设计（不引入第三方依赖，服务端只有标准库）：
 - 分块：按空行/标题切段，超长再硬切，块间留少量重叠；
 - 嵌入：调用本机 Ollama HTTP 接口（`/api/embed` 批量，失败回退 `/api/embeddings` 单个）；
 - 存储：`vec_chunks` 存块文本 + 归一化后的 float32 向量（BLOB），`vec_docs` 记录
-  文件 mtime/size 用于增量重嵌；
+  来源 size/mtime（笔记）/ rev（知识库归档）用于增量重嵌；
+- 内容来源：个人笔记读本机文件，知识库读 depot 已上传归档（不依赖本机工作区）；
 - 检索：查询串嵌入后与内存缓存的块向量做点积（向量已归一化 → 点积即余弦），
   取每篇文档最高分块分作为该文档的语义相似度；
 - 与词法检索的融合在 `search_index.search` 里做（`_W_VEC` 加权）。
@@ -491,6 +492,7 @@ def init_schema(conn) -> None:
           rel TEXT NOT NULL DEFAULT '',
           size INTEGER NOT NULL DEFAULT 0,
           mtime REAL NOT NULL DEFAULT 0,
+          rev INTEGER NOT NULL DEFAULT 0,
           chunks INTEGER NOT NULL DEFAULT 0,
           model TEXT NOT NULL DEFAULT '',
           embedded_at TEXT NOT NULL
@@ -506,50 +508,59 @@ def init_schema(conn) -> None:
         CREATE INDEX IF NOT EXISTS idx_vec_chunks_doc ON vec_chunks(doc_key);
         """
     )
+    _ensure_column(conn, "vec_docs", "rev", "rev INTEGER NOT NULL DEFAULT 0")
     init_settings_schema(conn)
     conn.commit()
+
+
+def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+    """幂等补列（旧库升级：知识库源改走 depot 归档后需要 rev 做增量比对）。
+
+    PRAGMA table_info 第 0 列是 cid，列名在第 1 列（不依赖 row_factory）。
+    """
+    cols = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def _doc_key(source: str, kb_name: str, rel: str) -> str:
     return rel if source == "note" else search_index._kb_key(kb_name, rel)
 
 
-def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[tuple[str, str, str, Path, str, int, float]]:
-    """待嵌入文档：[(doc_key, source, kb_name, 绝对路径, rel, size, mtime)]。
+def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str, Any]]:
+    """待嵌入文档：[{key, source, kb_name, rel, size, mtime, rev, path}]。
 
-    以 search_docs（词法索引）为准，比对 vec_docs 的 mtime/size 找出新增/变更；
-    同时清理 vec_docs 中已不在 search_docs 的条目。
+    以 search_docs（词法索引）为准，比对 vec_docs 的 size/mtime/rev 找出新增/变更；
+    同时清理 vec_docs 中已不在 search_docs 的条目。个人笔记读本机文件（path），
+    知识库文档读 depot 归档（path 为 None，内容按 rel+rev 取）。
     """
     docs_rows = conn.execute(
-        "SELECT note_path AS key, source, kb_name, rel, size, mtime FROM search_docs"
+        "SELECT note_path AS key, source, kb_name, rel, size, mtime, rev FROM search_docs"
     ).fetchall()
     have = {
-        r["doc_key"]: (int(r["size"]), float(r["mtime"]), str(r["model"]))
-        for r in conn.execute("SELECT doc_key, size, mtime, model FROM vec_docs")
+        r["doc_key"]: (int(r["size"]), float(r["mtime"]), int(r["rev"]), str(r["model"]))
+        for r in conn.execute("SELECT doc_key, size, mtime, rev, model FROM vec_docs")
     }
     mdl = model(conn)
-    todo: list[tuple[str, str, str, Path, str, int, float]] = []
+    todo: list[dict[str, Any]] = []
     alive: set[str] = set()
     for r in docs_rows:
-        key = r["key"]
+        key = str(r["key"])
         alive.add(key)
-        prev = have.get(key)
-        if not force and prev and prev[0] == int(r["size"]) and abs(prev[1] - float(r["mtime"])) < 1e-6 and prev[2] == mdl:
+        if not force and have.get(key) == (int(r["size"]), float(r["mtime"]), int(r["rev"]), mdl):
             continue
-        source, kb_name, rel = r["source"], r["kb_name"], r["rel"]
+        source, kb_name, rel = str(r["source"]), str(r["kb_name"]), str(r["rel"])
+        path: Path | None = None
         if source == "note":
             try:
                 path = search_index.file_store.resolve_note_path(Path(notes_root), rel)
             except ValueError:
                 continue
-        else:
-            root = conn.execute(
-                "SELECT workspace FROM knowledge_bases WHERE name = ?", (kb_name,)
-            ).fetchone()
-            if not root or not str(root["workspace"]).strip():
-                continue
-            path = Path(str(root["workspace"])) / rel
-        todo.append((key, source, kb_name, path, rel, int(r["size"]), float(r["mtime"])))
+        todo.append({
+            "key": key, "source": source, "kb_name": kb_name, "rel": rel,
+            "size": int(r["size"]), "mtime": float(r["mtime"]), "rev": int(r["rev"]),
+            "path": path,
+        })
     stale = [k for k in have if k not in alive]
     for key in stale:
         drop_doc(conn, key)
@@ -558,22 +569,34 @@ def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[tuple[str
     return todo
 
 
+def _doc_text(conn, doc: dict[str, Any]) -> str:
+    """取待嵌入正文：个人笔记读本机文件，知识库文档读 depot 归档（不依赖本机工作区）。"""
+    if doc["source"] == "note":
+        return search_index.file_store.read_text_capped(doc["path"], search_index.MAX_INDEX_BYTES)
+    from . import depot_map
+
+    return depot_map.read_text(
+        conn, doc["kb_name"], rel=doc["rel"], rev=int(doc["rev"]),
+        max_bytes=search_index.MAX_INDEX_BYTES,
+    )
+
+
 def drop_doc(conn, doc_key: str) -> None:
     conn.execute("DELETE FROM vec_chunks WHERE doc_key = ?", (doc_key,))
     conn.execute("DELETE FROM vec_docs WHERE doc_key = ?", (doc_key,))
     _invalidate()
 
 
-def embed_doc(conn, doc_key: str, source: str, kb_name: str, rel: str, path: Path,
-              size: int, mtime: float) -> int:
+def embed_doc(conn, doc: dict[str, Any]) -> int:
     """嵌入一篇文档（先删旧块）。返回块数。"""
+    key, source, kb_name, rel = doc["key"], doc["source"], doc["kb_name"], doc["rel"]
     model_name = model(conn)
-    text = search_index.file_store.read_text_capped(path, search_index.MAX_INDEX_BYTES)
+    text = _doc_text(conn, doc)
     block = chunk_size_for(model_name)
     chunks = chunk_text(text, size=block, overlap=max(40, block // 8))
-    conn.execute("DELETE FROM vec_chunks WHERE doc_key = ?", (doc_key,))
+    conn.execute("DELETE FROM vec_chunks WHERE doc_key = ?", (key,))
     if not chunks:
-        conn.execute("DELETE FROM vec_docs WHERE doc_key = ?", (doc_key,))
+        conn.execute("DELETE FROM vec_docs WHERE doc_key = ?", (key,))
         _invalidate()
         return 0
     model_name = model(conn)
@@ -584,17 +607,18 @@ def embed_doc(conn, doc_key: str, source: str, kb_name: str, rel: str, path: Pat
             norm = _normalize(vec)
             conn.execute(
                 "INSERT INTO vec_chunks(doc_key, chunk_no, text, dim, vec) VALUES(?,?,?,?,?)",
-                (doc_key, i + j, chunk, len(norm), _pack(norm)),
+                (key, i + j, chunk, len(norm), _pack(norm)),
             )
         with _lock:
             embed_state["done"] = int(embed_state.get("done", 0)) + len(batch)
     conn.execute(
-        "INSERT INTO vec_docs(doc_key, source, kb_name, rel, size, mtime, chunks, model, embedded_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?)"
+        "INSERT INTO vec_docs(doc_key, source, kb_name, rel, size, mtime, rev, chunks, model, embedded_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(doc_key) DO UPDATE SET source=excluded.source, kb_name=excluded.kb_name,"
-        " rel=excluded.rel, size=excluded.size, mtime=excluded.mtime, chunks=excluded.chunks,"
-        " model=excluded.model, embedded_at=excluded.embedded_at",
-        (doc_key, source, kb_name, rel, int(size), float(mtime), len(chunks), model_name, _now()),
+        " rel=excluded.rel, size=excluded.size, mtime=excluded.mtime, rev=excluded.rev,"
+        " chunks=excluded.chunks, model=excluded.model, embedded_at=excluded.embedded_at",
+        (key, source, kb_name, rel, int(doc["size"]), float(doc["mtime"]), int(doc["rev"]),
+         len(chunks), model_name, _now()),
     )
     conn.commit()
     _invalidate()
@@ -609,9 +633,9 @@ def refresh(conn, notes_root: Path, *, force: bool = False) -> int:
     if not todo:
         return 0
     done = 0
-    for doc_key, source, kb_name, path, rel, size, mtime in todo:
+    for doc in todo:
         try:
-            embed_doc(conn, doc_key, source, kb_name, rel, path, size, mtime)
+            embed_doc(conn, doc)
             done += 1
         except Exception as exc:  # noqa: BLE001 - 单篇失败不影响其它
             with _lock:
@@ -645,8 +669,8 @@ def _embed_worker(db_path: Path, notes_root: Path, force: bool) -> None:
         with _lock:
             embed_state["phase"] = "embedding"
             embed_state["total"] = len(todo)
-        for doc_key, source, kb_name, path, rel, size, mtime in todo:
-            embed_doc(conn, doc_key, source, kb_name, rel, path, size, mtime)
+        for doc in todo:
+            embed_doc(conn, doc)
             with _lock:
                 embed_state["docs"] = int(embed_state.get("docs", 0)) + 1
     except Exception as exc:  # noqa: BLE001
