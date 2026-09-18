@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Request
@@ -35,6 +35,7 @@ def api_search(
     offset: int = 0,
     sources: str = "",
     mode: str = "hybrid",
+    rerank: Optional[int] = None,
 ) -> dict[str, Any]:
     """全文检索（倒排索引，毫秒级；权限过滤在 SQL 内完成）。
 
@@ -42,8 +43,10 @@ def api_search(
       查询里用 `"引号"` 包住可要求精确短语。
     - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库归档），默认全部。
     - `mode`：`hybrid`（默认，词法 + 语义加分，词法空时语义兜底）/ `lex`（纯词法）/ `sem`（纯语义）。
+    - `rerank`：`0` 本次不用本地重排、`1` 使用（受全局配置约束），不传用全局配置。
     - 返回 hits：命中的来源、相对路径、打开地址 open_url、摘要、命中词 matches、
-      覆盖率 / 词频 / 近邻 / bm25 / 语义相似度 vec / 总分 score。
+      块级信息 chunk / chunk_no / chunk_offset、覆盖率 / 词频 / 近邻 / bm25 / 语义相似度 vec /
+      重排分 rerank / 总分 score，以及 rerank 汇总（是否使用 / 模型 / 条数 / 耗时 / 原因）。
     """
     src = [s.strip() for s in (sources or "").split(",") if s.strip()]
     result = search_index.search(
@@ -56,6 +59,7 @@ def api_search(
         offset=offset,
         sources=src or None,
         mode=(mode or "hybrid").strip().lower(),
+        rerank=None if rerank is None else bool(rerank),
     )
     hits = [{**h, "open_url": _open_url(request, h)} for h in result["hits"]]
     return {"query": q, "limit": limit, "offset": offset, **{**result, "hits": hits}}
@@ -123,6 +127,28 @@ def api_download_model(
         "message": f"已开始下载 {name}" if started else "已有下载在进行",
         "download": dict(search_vec.download_state),
     }
+
+
+class RerankRequest(BaseModel):
+    enabled: Optional[bool] = None
+    model: Optional[str] = None
+
+
+@router.get("/rerank")
+def api_rerank_status(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """本地重排状态（可用性 / 模型 / 候选上限 / 超时 / 最近耗时 / 降级原因）。"""
+    return search_vec.rerank_status(conn)
+
+
+@router.post("/rerank")
+def api_set_rerank(
+    request: Request,
+    payload: RerankRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """切换本地重排开关 / 模型（管理员）。"""
+    require_admin(request)
+    return search_vec.set_rerank(conn, enabled=payload.enabled, model=payload.model)
 
 
 @router.get("/stats")

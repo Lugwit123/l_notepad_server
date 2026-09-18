@@ -27,7 +27,7 @@ import urllib.request
 from array import array
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from . import search_index
 
@@ -447,36 +447,54 @@ def _dot(a: tuple[float, ...], b: tuple[float, ...]) -> float:
 # ── 分块 ────────────────────────────────────────────────
 
 
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """按空行/标题切成段，超长段落再按 size 硬切并保留 overlap 重叠。"""
+def chunk_spans(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[tuple[int, str]]:
+    """按空行/标题切成段，超长段落再按 size 硬切并保留 overlap 重叠。
+
+    返回 [(块在归一化正文中的起始偏移, 块文本)]；偏移取该块首个段落的起始位置
+    （段间多余空行会被合并成 `\\n\\n`，块文本与正文切片可能有细微差异，定位时再按文本查找兜底）。
+    """
     norm = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not norm:
         return []
-    chunks: list[str] = []
+    spans: list[tuple[int, str]] = []
     buf = ""
-    for para in norm.split("\n\n"):
-        para = para.strip()
+    buf_start = 0
+    pos, total = 0, len(norm)
+    while pos <= total:
+        sep = norm.find("\n\n", pos)
+        end = total if sep < 0 else sep
+        raw = norm[pos:end]
+        para = raw.strip()
+        p_start = pos + (len(raw) - len(raw.lstrip()))
+        pos = total + 1 if sep < 0 else sep + 2
         if not para:
             continue
         if len(buf) + len(para) + 2 <= size:
+            if not buf:
+                buf_start = p_start
             buf = f"{buf}\n\n{para}" if buf else para
             continue
         if buf:
-            chunks.append(buf)
+            spans.append((buf_start, buf))
             buf = ""
         if len(para) <= size:
-            buf = para
+            buf, buf_start = para, p_start
             continue
         step = max(1, size - overlap)
         for i in range(0, len(para), step):
             piece = para[i : i + size]
             if piece.strip():
-                chunks.append(piece)
+                spans.append((p_start + i, piece))
             if i + size >= len(para):
                 break
     if buf:
-        chunks.append(buf)
-    return chunks[:MAX_CHUNKS_PER_DOC]
+        spans.append((buf_start, buf))
+    return spans[:MAX_CHUNKS_PER_DOC]
+
+
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """按空行/标题切成段，超长段落再按 size 硬切并保留 overlap 重叠。"""
+    return [t for _start, t in chunk_spans(text, size=size, overlap=overlap)]
 
 
 # ── 建表 / 增量嵌入 ─────────────────────────────────────
@@ -502,6 +520,7 @@ def init_schema(conn) -> None:
           doc_key TEXT NOT NULL,
           chunk_no INTEGER NOT NULL,
           text TEXT NOT NULL,
+          "start" INTEGER NOT NULL DEFAULT 0,
           dim INTEGER NOT NULL DEFAULT 0,
           vec BLOB NOT NULL
         );
@@ -509,6 +528,8 @@ def init_schema(conn) -> None:
         """
     )
     _ensure_column(conn, "vec_docs", "rev", "rev INTEGER NOT NULL DEFAULT 0")
+    # 块在正文中的起始偏移（旧库补列，默认 0 → 定位时回退到按块文本查找）
+    _ensure_column(conn, "vec_chunks", "start", '"start" INTEGER NOT NULL DEFAULT 0')
     init_settings_schema(conn)
     conn.commit()
 
@@ -593,7 +614,7 @@ def embed_doc(conn, doc: dict[str, Any]) -> int:
     model_name = model(conn)
     text = _doc_text(conn, doc)
     block = chunk_size_for(model_name)
-    chunks = chunk_text(text, size=block, overlap=max(40, block // 8))
+    chunks = chunk_spans(text, size=block, overlap=max(40, block // 8))
     conn.execute("DELETE FROM vec_chunks WHERE doc_key = ?", (key,))
     if not chunks:
         conn.execute("DELETE FROM vec_docs WHERE doc_key = ?", (key,))
@@ -602,12 +623,12 @@ def embed_doc(conn, doc: dict[str, Any]) -> int:
     model_name = model(conn)
     for i in range(0, len(chunks), BATCH):
         batch = chunks[i : i + BATCH]
-        vecs = embed_texts(batch, model_name)
-        for j, (chunk, vec) in enumerate(zip(batch, vecs)):
+        vecs = embed_texts([t for _s, t in batch], model_name)
+        for j, ((start, chunk), vec) in enumerate(zip(batch, vecs)):
             norm = _normalize(vec)
             conn.execute(
-                "INSERT INTO vec_chunks(doc_key, chunk_no, text, dim, vec) VALUES(?,?,?,?,?)",
-                (key, i + j, chunk, len(norm), _pack(norm)),
+                'INSERT INTO vec_chunks(doc_key, chunk_no, text, "start", dim, vec) VALUES(?,?,?,?,?,?)',
+                (key, i + j, chunk, int(start), len(norm), _pack(norm)),
             )
         with _lock:
             embed_state["done"] = int(embed_state.get("done", 0)) + len(batch)
@@ -722,8 +743,8 @@ def _load_cache(conn) -> dict[str, list[tuple[int, tuple[float, ...]]]]:
     return cache
 
 
-def search(conn, query: str, *, limit: int = 50) -> list[tuple[str, float]]:
-    """语义检索：返回 [(doc_key, 相似度)]，按相似度降序（每篇取最高分块）。"""
+def _best_chunks(conn, query: str, *, limit: int) -> list[tuple[str, int, float]]:
+    """每篇文档取相似度最高的块：[(doc_key, chunk_no, 相似度)]，按相似度降序。"""
     if not enabled() or not query.strip():
         return []
     mdl = model(conn)
@@ -742,16 +763,297 @@ def search(conn, query: str, *, limit: int = 50) -> list[tuple[str, float]]:
         qvec = _normalize(embed_texts([query_text(query, mdl)], mdl)[0])
     except Exception:
         return []
-    best: dict[str, float] = {}
+    best: dict[str, tuple[int, float]] = {}
     for doc_key, chunks in cache.items():
-        top = 0.0
-        for _no, vec in chunks:
+        top_no, top = 0, 0.0
+        for no, vec in chunks:
             score = _dot(qvec, vec)
             if score > top:
-                top = score
+                top, top_no = score, no
         if top > 0:
-            best[doc_key] = top
-    return sorted(best.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+            best[doc_key] = (top_no, top)
+    ranked = sorted(best.items(), key=lambda kv: kv[1][1], reverse=True)[:limit]
+    return [(k, no, score) for k, (no, score) in ranked]
+
+
+def search(conn, query: str, *, limit: int = 50) -> list[tuple[str, float]]:
+    """语义检索：返回 [(doc_key, 相似度)]，按相似度降序（每篇取最高分块）。"""
+    return [(k, score) for k, _no, score in _best_chunks(conn, query, limit=limit)]
+
+
+def search_chunks(conn, query: str, *, limit: int = 50) -> list[tuple[str, int, int, str, float]]:
+    """语义检索（块级）：[(doc_key, chunk_no, 起始偏移, 块文本, 相似度)]，降序（每篇取最高分块）。"""
+    out: list[tuple[str, int, int, str, float]] = []
+    for doc_key, chunk_no, score in _best_chunks(conn, query, limit=limit):
+        row = conn.execute(
+            'SELECT "start" AS start, text FROM vec_chunks WHERE doc_key = ? AND chunk_no = ?',
+            (doc_key, chunk_no),
+        ).fetchone()
+        if row is None:
+            continue
+        out.append((doc_key, chunk_no, int(row["start"]), str(row["text"]), score))
+    return out
+
+
+def doc_chunks(conn, doc_keys: Iterable[str]) -> dict[str, list[tuple[int, int, str]]]:
+    """批量取文档全部块：{doc_key: [(chunk_no, 起始偏移, 块文本)]}（块序升序）。"""
+    keys = [k for k in dict.fromkeys(doc_keys or []) if k]
+    if not keys:
+        return {}
+    out: dict[str, list[tuple[int, int, str]]] = {}
+    for i in range(0, len(keys), 200):
+        batch = keys[i : i + 200]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            'SELECT doc_key, chunk_no, "start" AS start, text FROM vec_chunks'
+            f" WHERE doc_key IN ({placeholders}) ORDER BY doc_key, chunk_no",
+            tuple(batch),
+        )
+        for r in rows:
+            out.setdefault(str(r["doc_key"]), []).append(
+                (int(r["chunk_no"]), int(r["start"]), str(r["text"]))
+            )
+    return out
+
+
+# ── 重排（本地 cross-encoder，llama.cpp /rerank）─────────
+#
+# 与 embedding 一样走 HTTP + 标准库 urllib，服务端不引第三方依赖。
+# 未配置地址 / 关闭 / 冷却 / 调用失败一律降级：调用方退回原融合排序。
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+RERANK_URL = os.environ.get("L_NOTEPAD_RERANK_URL", "").strip().rstrip("/")
+RERANK_MODEL_ENV = os.environ.get("L_NOTEPAD_RERANK_MODEL", "").strip()
+RERANK_TIMEOUT_S = _env_float("L_NOTEPAD_RERANK_TIMEOUT_S", 3.0)
+RERANK_TOP_N = _env_int("L_NOTEPAD_RERANK_TOP_N", 40)
+RERANK_FAIL_LIMIT = 3       # 连续失败多少次后进入冷却
+RERANK_COOLDOWN_S = 60.0    # 冷却时长（冷却期内不发起请求）
+RERANK_PROBE_TTL_S = 60.0   # 可用性探测结果的缓存时长
+
+SETTING_RERANK_ENABLED = "rerank_enabled"
+SETTING_RERANK_MODEL = "rerank_model"
+
+# 重排运行时状态（状态页展示 + 降级判定）
+rerank_state: dict[str, Any] = {
+    "ok": False,        # 最近一次探测/调用是否可用
+    "reason": "",       # 不可用原因
+    "took_ms": 0.0,     # 最近一次请求耗时
+    "probed_at": 0.0,   # 最近一次探测（monotonic）
+    "cool_until": 0.0,  # 冷却截止（monotonic）
+    "fails": 0,         # 连续失败次数
+    "last_ok_at": "",   # 最近一次成功（本地时间）
+    "path": "",         # 探测到的可用路径（/rerank 或 /v1/rerank）
+}
+
+
+def _flag(value: str) -> bool:
+    return str(value or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def rerank_configured() -> bool:
+    """是否配置了重排服务地址。"""
+    return bool(RERANK_URL)
+
+
+def rerank_enabled(conn=None) -> bool:
+    """重排是否启用：地址必须已配置；开关 env > 页面设置 > 默认开。"""
+    if not RERANK_URL:
+        return False
+    raw = os.environ.get("L_NOTEPAD_RERANK_ENABLED", "").strip()
+    if raw:
+        return _flag(raw)
+    if conn is not None:
+        try:
+            configured = get_setting(conn, SETTING_RERANK_ENABLED)
+        except Exception:
+            configured = ""
+        if configured:
+            return _flag(configured)
+    return True
+
+
+def rerank_model(conn=None) -> str:
+    """重排模型名：env > 页面设置 > 空（由服务端默认模型决定）。"""
+    if RERANK_MODEL_ENV:
+        return RERANK_MODEL_ENV
+    if conn is not None:
+        try:
+            configured = get_setting(conn, SETTING_RERANK_MODEL)
+        except Exception:
+            configured = ""
+        if configured:
+            return configured
+    return ""
+
+
+def _rerank_post(path: str, payload: dict) -> Any:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        f"{RERANK_URL}{path}", data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _rerank_call(query: str, documents: list[str], model_name: str) -> list[tuple[int, float]]:
+    """发起重排请求，返回 [(下标, 相关度)]；失败抛异常。"""
+    payload: dict[str, Any] = {"query": query, "documents": list(documents)}
+    if model_name:
+        payload["model"] = model_name
+    paths = [str(rerank_state.get("path") or ""), "/rerank", "/v1/rerank"]
+    last: Exception | None = None
+    for path in dict.fromkeys(p for p in paths if p):
+        try:
+            data = _rerank_post(path, payload)
+        except urllib.error.HTTPError as exc:
+            last = exc
+            continue  # 路径不存在（404 等）→ 换下一条路径试
+        except Exception as exc:  # noqa: BLE001 - 连不上/超时换路径也没用，直接降级
+            raise last or exc
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list) or not results:
+            last = ValueError("返回结构不符（无 results）")
+            continue
+        out: list[tuple[int, float]] = []
+        for item in results:
+            try:
+                out.append((int(item["index"]), float(item.get("relevance_score") or 0.0)))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not out:
+            last = ValueError("results 无法解析")
+            continue
+        with _lock:
+            rerank_state["path"] = path
+        return out
+    raise last or RuntimeError("rerank 请求失败")
+
+
+def rerank_docs(
+    conn, query: str, documents: list[str]
+) -> tuple[Optional[list[tuple[int, float]]], dict[str, Any]]:
+    """对候选块做重排，返回 ([(下标, 相关度)] | None, 信息)。
+
+    None 表示本轮未使用重排（未配置 / 已关闭 / 冷却中 / 调用失败），信息里带原因与耗时，
+    调用方据此退回原融合排序。连续失败 `RERANK_FAIL_LIMIT` 次后进入 `RERANK_COOLDOWN_S` 冷却，
+    冷却期内不再发起网络请求。
+    """
+    info: dict[str, Any] = {"used": False, "model": "", "scored": 0, "took_ms": 0.0, "reason": ""}
+    if not documents:
+        return None, info
+    if not rerank_configured():
+        info["reason"] = "未配置 L_NOTEPAD_RERANK_URL"
+        return None, info
+    if not rerank_enabled(conn):
+        info["reason"] = "重排已关闭"
+        return None, info
+    model_name = rerank_model(conn)
+    info["model"] = model_name
+    now = time.monotonic()
+    with _lock:
+        cool_until = float(rerank_state["cool_until"])
+        probed_at = float(rerank_state["probed_at"])
+        ok = bool(rerank_state["ok"])
+        reason = str(rerank_state["reason"] or "")
+    if cool_until > now:
+        info["reason"] = f"失败冷却中（剩 {int(cool_until - now)}s）"
+        return None, info
+    if probed_at and now - probed_at < RERANK_PROBE_TTL_S and not ok:
+        info["reason"] = reason or "探测不通过"
+        return None, info
+
+    started = time.perf_counter()
+    try:
+        out = _rerank_call(query, documents, model_name)
+    except Exception as exc:  # noqa: BLE001 - 降级：本轮退回融合排序
+        took = round((time.perf_counter() - started) * 1000, 2)
+        with _lock:
+            fails = int(rerank_state["fails"]) + 1
+            rerank_state.update({
+                "ok": False, "reason": f"{type(exc).__name__}: {exc}", "took_ms": took,
+                "probed_at": now, "fails": fails,
+            })
+            if fails >= RERANK_FAIL_LIMIT:
+                rerank_state["cool_until"] = now + RERANK_COOLDOWN_S
+        info["reason"] = str(rerank_state["reason"])
+        info["took_ms"] = took
+        return None, info
+    took = round((time.perf_counter() - started) * 1000, 2)
+    with _lock:
+        rerank_state.update({
+            "ok": True, "reason": "", "took_ms": took, "probed_at": now,
+            "fails": 0, "cool_until": 0.0, "last_ok_at": _now(),
+        })
+    info.update({"used": True, "scored": len(out), "took_ms": took})
+    return out, info
+
+
+def rerank_status(conn=None) -> dict[str, Any]:
+    """重排状态（状态页 / 接口展示）。"""
+    with _lock:
+        st = dict(rerank_state)
+    now = time.monotonic()
+    cool_left = max(0.0, float(st["cool_until"]) - now)
+    configured = rerank_configured()
+    is_on = rerank_enabled(conn)
+    reason = str(st["reason"] or "")
+    if not configured:
+        reason = "未配置 L_NOTEPAD_RERANK_URL"
+    elif not is_on:
+        reason = "重排已关闭（L_NOTEPAD_RERANK_ENABLED=0 / 页面关闭）"
+    elif not reason:
+        reason = "尚未调用（首次检索时探测）"
+    return {
+        "configured": configured,
+        "enabled": is_on,
+        "available": bool(configured and is_on and st["ok"]),
+        "ok": bool(st["ok"]),
+        "reason": reason,
+        "url": RERANK_URL,
+        "model": rerank_model(conn),
+        "path": str(st["path"] or ""),
+        "top_n": RERANK_TOP_N,
+        "timeout_s": RERANK_TIMEOUT_S,
+        "took_ms": round(float(st["took_ms"]), 2),
+        "fails": int(st["fails"]),
+        "cool_s": round(cool_left, 1),
+        "cool_after_fails": RERANK_FAIL_LIMIT,
+        "last_ok_at": str(st["last_ok_at"] or ""),
+        "env_override": {
+            "url": RERANK_URL,
+            "model": RERANK_MODEL_ENV,
+            "enabled": os.environ.get("L_NOTEPAD_RERANK_ENABLED", "").strip(),
+            "top_n": os.environ.get("L_NOTEPAD_RERANK_TOP_N", "").strip(),
+            "timeout_s": os.environ.get("L_NOTEPAD_RERANK_TIMEOUT_S", "").strip(),
+        },
+    }
+
+
+def set_rerank(conn, *, enabled: Optional[bool] = None, model: Optional[str] = None) -> dict[str, Any]:
+    """切换重排开关 / 模型（写设置表），并清掉探测与冷却状态以便立即重新探测。"""
+    if enabled is not None:
+        set_setting(conn, SETTING_RERANK_ENABLED, "1" if enabled else "0")
+    if model is not None:
+        set_setting(conn, SETTING_RERANK_MODEL, (model or "").strip())
+    with _lock:
+        rerank_state.update({"ok": False, "reason": "", "probed_at": 0.0, "cool_until": 0.0, "fails": 0})
+    return {"ok": True, "status": rerank_status(conn)}
 
 
 def stats(conn) -> dict[str, Any]:

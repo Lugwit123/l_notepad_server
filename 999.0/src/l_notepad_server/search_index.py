@@ -306,12 +306,60 @@ def _anchor(text_low: str, units: list[dict[str, str]], width: int = 180) -> tup
     return best_pos, present
 
 
-def _snippet(body: str, units: list[dict[str, str]], width: int = 180, lead: int = 60) -> tuple[str, list[str]]:
-    """命中位置附近的摘要（短语优先定位）+ 高亮词列表。"""
+def _chunk_pos(text: str, units: list[dict[str, str]], chunk_text: str, chunk_offset: int) -> tuple[int, list[str]]:
+    """用命中块定位摘要：块偏移有效则用偏移，否则按块首行/前缀在正文里查找。
+
+    返回 (位置, 高亮词)；块内没有查询词时高亮词为空（语义命中本来就没有词法依据）。
+    """
+    chunk = (chunk_text or "").strip()
+    if not chunk:
+        return -1, []
+    pos = -1
+    if 0 <= int(chunk_offset) < len(text):
+        head = chunk[:16]
+        if text.startswith(head, int(chunk_offset)):
+            pos = int(chunk_offset)
+    if pos < 0:
+        # 长前缀最精确 → 首行（段间空行被合并时仍可用）→ 兜底前缀
+        first = chunk.split("\n", 1)[0].strip()
+        for probe in (chunk[:60], first, chunk[:80]):
+            if len(probe) < 4:
+                continue
+            pos = text.find(probe)
+            if pos >= 0:
+                break
+    if pos < 0:
+        return -1, []
+
+    low = chunk.lower()
+    phrases = [u["text"] for u in units if u["type"] == "phrase" and u["text"].lower() in low]
+    if phrases:
+        return pos, phrases[:1]
+    present = [
+        t for t in sorted({u["text"] for u in units if u["type"] != "phrase"}, key=len, reverse=True)
+        if t.lower() in low
+    ]
+    return pos, present
+
+
+def _snippet(
+    body: str,
+    units: list[dict[str, str]],
+    width: int = 180,
+    lead: int = 60,
+    chunk_text: str = "",
+    chunk_offset: int = 0,
+) -> tuple[str, list[str]]:
+    """命中位置附近的摘要 + 高亮词列表。
+
+    定位顺序：命中块（偏移 → 文本查找）→ 短语优先 → 命中词块最密集窗口。
+    """
     text = (body or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return "", []
-    pos, matches = _anchor(text.lower(), units)
+    pos, matches = _chunk_pos(text, units, chunk_text, chunk_offset)
+    if pos < 0:
+        pos, matches = _anchor(text.lower(), units)
     if pos < 0:
         head = text[:width].replace("\n", " ")
         return head + ("…" if len(text) > width else ""), []
@@ -882,6 +930,18 @@ def _vec_stats(conn) -> dict[str, Any]:
         return {"available": {"available": False, "reason": f"{type(exc).__name__}: {exc}"}}
 
 
+def _rerank_stats(conn) -> dict[str, Any]:
+    """重排状态（容错：取不到时返回不可用状态，不影响状态页其它字段）。"""
+    try:
+        from . import search_vec
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "enabled": False, "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        return search_vec.rerank_status(conn)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "enabled": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def _verify_notes(conn, root: Path) -> dict[str, int]:
     """笔记源磁盘校对：磁盘文件数 / 未索引 / mtime 过期 / 多余行。"""
     indexed = {
@@ -1026,6 +1086,7 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
     result: dict[str, Any] = {
         "docs": int(docs),
         "vec": _vec_stats(conn),
+        "rerank": _rerank_stats(conn),
         "fts_rows": int(fts_rows),
         "fts_consistent": int(docs) == int(fts_rows),
         "db_bytes": int(page) * int(page_size),
@@ -1080,6 +1141,109 @@ __all__ = [
 # ── 检索 ────────────────────────────────────────────────
 
 
+def _rerank_decision(conn, rerank: bool | None) -> tuple[bool, str]:
+    """本次请求是否使用重排，以及未使用时的说明（供接口/页面对照）。"""
+    try:
+        from . import search_vec
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    try:
+        configured = search_vec.rerank_configured()
+        enabled = search_vec.rerank_enabled(conn)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    if not configured:
+        return False, "未配置 L_NOTEPAD_RERANK_URL"
+    if not enabled:
+        return False, "重排已关闭"
+    if rerank is False:
+        return False, "本次请求关闭（rerank=0）"
+    return True, ""
+
+
+def _best_chunk(chunks: list[tuple[int, int, str]], units: list[dict[str, str]]) -> tuple[int, int, str]:
+    """在文档的块里挑词法最匹配的一块（短语命中优先，再按覆盖率/词频分）。"""
+    best_no, best_start, best_text = 0, 0, ""
+    best_key: tuple[int, float] | None = None
+    for no, start, text in chunks:
+        meta = _score(text.lower(), units, 0.0)
+        key = (meta["phrase_hits"], float(meta["score"]))
+        if best_key is None or key > best_key:
+            best_no, best_start, best_text, best_key = no, start, text, key
+    return best_no, best_start, best_text
+
+
+def _chunk_map(
+    conn, query: str, keys: list[str], units: list[dict[str, str]], *, semantic: bool
+) -> dict[str, tuple[int, int, str, float]]:
+    """每篇命中文档的「命中块」：{key: (块序号, 偏移, 块文本, 向量分)}。
+
+    语义可用时优先取向量的最优块；其余（仅词法模式、或该文档不在语义候选里）按词法在块文本里选最优块 ——
+    两种情况都不额外发起 embedding 请求。无块向量的文档不出现在结果里。
+    """
+    if not keys:
+        return {}
+    try:
+        from . import search_vec
+    except Exception:  # noqa: BLE001 - 块级信息是增强，取不到不影响检索
+        return {}
+    wanted = set(keys)
+    out: dict[str, tuple[int, int, str, float]] = {}
+    if semantic:
+        try:
+            for key, no, start, text, score in search_vec.search_chunks(
+                conn, query, limit=max(len(wanted) * 2, 40)
+            ):
+                if key in wanted and key not in out:
+                    out[key] = (no, start, text, score)
+        except Exception:  # noqa: BLE001
+            pass
+    missing = [k for k in keys if k not in out]
+    if missing:
+        try:
+            for key, chunks in search_vec.doc_chunks(conn, missing).items():
+                if not chunks:
+                    continue
+                no, start, text = _best_chunk(chunks, units)
+                if text:
+                    out[key] = (no, start, text, 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _apply_rerank(
+    conn, query: str, hits: list[dict[str, Any]], *, allow: bool, off_reason: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """候选块重排：已重排按重排分主序，未参与重排的候选垫底并保持原相对顺序。
+
+    重排分不并入 `score`（cross-encoder 分与线性融合分量纲不可比），只作为排序主序与独立字段。
+    """
+    info: dict[str, Any] = {"used": False, "model": "", "scored": 0, "took_ms": 0.0, "reason": off_reason}
+    if not allow or not hits:
+        return hits, info
+    try:
+        from . import search_vec
+    except Exception as exc:  # noqa: BLE001
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        return hits, info
+    top_n = max(1, int(search_vec.RERANK_TOP_N))
+    cand = [h for h in hits if h.get("chunk")][:top_n]
+    if not cand:
+        info["reason"] = "候选无命中块（无块向量）"
+        return hits, info
+    scores, sub = search_vec.rerank_docs(conn, query, [str(h["chunk"]) for h in cand])
+    info.update(sub)
+    if not scores:
+        return hits, info
+    smap = dict(scores)
+    for i, hit in enumerate(cand):
+        hit["rerank"] = round(float(smap.get(i, 0.0)), 4)
+    ranked = sorted(cand, key=lambda h: (-h["rerank"], -h["score"], h["path"]))
+    ranked_ids = {id(h) for h in ranked}
+    return ranked + [h for h in hits if id(h) not in ranked_ids], info
+
+
 def search(
     conn,
     notes_root: Path,
@@ -1092,16 +1256,22 @@ def search(
     sources: list[str] | None = None,
     mode: str = "hybrid",
     kb_name: str = "",
+    rerank: bool | None = None,
 ) -> dict[str, Any]:
     """倒排检索（只查索引表，不读文档）。
 
-    宽召回 + 重排：同段 bigram OR 召回，再按「短语命中 > 覆盖率 > 词频/近邻 > bm25」加权评分排序。
+    宽召回 + 重排：同段 bigram OR 召回，再按「短语命中 > 覆盖率 > 词频/近邻 > bm25」加权评分排序，
+    最后按需用本地重排服务对候选块做交叉编码重排（不可用时静默退回融合排序）。
     `"引号"` 精确短语无结果时自动回退为整串模糊匹配（`fallback=True`）。
-    返回 {total, hits, took_ms, fallback}；hit 含 source（note/kb）、kb_name、rel、path、
-    snippet、coverage、tf、proximity、phrase_hits、bm25、score。
+    `rerank`：None 用全局配置，False 本次关闭（全局关闭时传 True 也不生效）。
+    返回 {total, hits, took_ms, fallback, vec, rerank}；hit 含 source（note/kb）、kb_name、rel、path、
+    snippet、matches、chunk、chunk_no、chunk_offset、rerank、coverage、tf、proximity、phrase_hits、bm25、score。
     """
-    empty: dict[str, Any] = {"total": 0, "hits": [], "took_ms": 0.0, "fallback": False,
-                             "vec": {"used": False, "model": "", "hits": 0}}
+    empty: dict[str, Any] = {
+        "total": 0, "hits": [], "took_ms": 0.0, "fallback": False,
+        "vec": {"used": False, "model": "", "hits": 0},
+        "rerank": {"used": False, "model": "", "scored": 0, "took_ms": 0.0, "reason": ""},
+    }
     units = parse_query(query or "")
     if not units:
         return empty
@@ -1147,7 +1317,9 @@ def search(
         vmap, vinfo = _vec_scores(conn, query, user=user, admin=admin, sources=sources, kb_name=kb_name)
         if mode == "sem" and not vmap:
             # 纯语义模式且语义无命中：不要回退成"词法 total 但列表为空"的误导结果
-            return {**empty, "took_ms": round((time.perf_counter() - started) * 1000, 2), "vec": vinfo}
+            reason = _rerank_decision(conn, rerank)[1] or "语义无命中，无可重排候选"
+            return {**empty, "took_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "vec": vinfo, "rerank": {**empty["rerank"], "reason": reason}}
         if mode == "sem":
             # 纯语义：只留有语义分的文档，按相似度排序（词法行用作补全 body/snippet）
             rows = [r for r in rows if r["key"] in vmap] + _vec_only_rows(
@@ -1162,8 +1334,15 @@ def search(
             )
 
     if total == 0 and not vmap:
-        return {**empty, "took_ms": round((time.perf_counter() - started) * 1000, 2)}
+        reason = _rerank_decision(conn, rerank)[1] or "无命中文档"
+        return {**empty, "took_ms": round((time.perf_counter() - started) * 1000, 2),
+                "rerank": {**empty["rerank"], "reason": reason}}
     total = len(vmap) if mode == "sem" and vmap else max(total, len(rows))
+
+    # 命中块（块级信息 + 重排候选）：语义优先，取不到时按词法在块文本里选
+    chunk_map = _chunk_map(
+        conn, query, [r["key"] for r in rows], units, semantic=mode in ("hybrid", "sem")
+    )
 
     hits: list[dict[str, Any]] = []
     for r in rows:
@@ -1172,7 +1351,8 @@ def search(
         if vec:
             meta["vec"] = round(vec, 4)
             meta["score"] = round(vec if mode == "sem" else meta["score"] + _W_VEC * vec, 4)
-        snippet, matches = _snippet(r["body"], units)
+        chunk_no, chunk_start, chunk_text, _chunk_vec = chunk_map.get(r["key"], (0, 0, "", 0.0))
+        snippet, matches = _snippet(r["body"], units, chunk_text=chunk_text, chunk_offset=chunk_start)
         hits.append(
             {
                 "path": r["rel"],
@@ -1181,6 +1361,10 @@ def search(
                 "rel": r["rel"],
                 "snippet": snippet,
                 "matches": matches,
+                "chunk": chunk_text,
+                "chunk_no": int(chunk_no),
+                "chunk_offset": int(chunk_start),
+                "rerank": 0.0,
                 "updated_at": _iso(r["mtime"]),
                 "coverage": meta["coverage"],
                 "tf": meta["tf"],
@@ -1195,6 +1379,11 @@ def search(
         hits.sort(key=lambda h: (-h["score"], h["path"]))
     else:
         hits.sort(key=lambda h: (-h["phrase_hits"], -h["score"], h["path"]))
+
+    # 重排（本地 cross-encoder）：重排分作主序，未参与重排的候选垫底
+    allow_rerank, off_reason = _rerank_decision(conn, rerank)
+    hits, rinfo = _apply_rerank(conn, query, hits, allow=allow_rerank, off_reason=off_reason)
+
     page = hits[offset : offset + limit]
     return {
         "total": total,
@@ -1202,6 +1391,7 @@ def search(
         "took_ms": round((time.perf_counter() - started) * 1000, 2),
         "fallback": fallback,
         "vec": vinfo,
+        "rerank": rinfo,
     }
 
 

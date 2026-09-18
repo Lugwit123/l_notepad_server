@@ -95,6 +95,17 @@
       </div>
 
       <div class="panel">
+        <h3>重排（rerank，本地交叉编码）</h3>
+        <div class="row-actions" style="margin-bottom:10px;">
+          <input class="q" id="rerank-model" placeholder="重排模型名（留空 = 服务端默认模型）" style="flex:0 0 auto; width:330px;" />
+          <button class="btn sm" type="button" id="btn-rerank-model" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>保存模型</button>
+          <button class="btn sm primary" type="button" id="btn-rerank-toggle" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>开启</button>
+          <span class="muted" id="rerank-hint"></span>
+        </div>
+        <div class="cards" id="rerank-kpis"></div>
+      </div>
+
+      <div class="panel">
         <h3>试搜（走同一套倒排索引）</h3>
         <div class="row-actions">
           <input class="q" id="q" placeholder="输入关键词，回车搜索…（&quot;引号&quot; 表示精确短语）" />
@@ -293,6 +304,46 @@
           document.getElementById("embed-text").textContent = txt;
         }
 
+        let rerankCache = {};
+
+        function renderRerank(d) {
+          const r = d.rerank || {};
+          rerankCache = r;
+          const on = !!r.available;
+          let html = "";
+          html += kpi("重排", on ? "已就绪" : "未生效", on ? (r.model || "服务端默认模型") : (r.reason || ""));
+          html += kpi("候选上限", r.top_n || 0, "每篇只送最优块 · 超时 " + (r.timeout_s || 0) + "s");
+          html += kpi("最近耗时", (r.took_ms || 0) + " ms",
+            r.last_ok_at ? "最近成功 " + r.last_ok_at : "尚无成功记录");
+          html += kpi("连续失败", r.fails || 0,
+            (r.cool_s || 0) > 0 ? "冷却中剩 " + r.cool_s + "s" : ("达 " + (r.cool_after_fails || 0) + " 次进入冷却"));
+          document.getElementById("rerank-kpis").innerHTML = html;
+          document.getElementById("rerank-hint").textContent = r.configured
+            ? ("服务：" + (r.url || "") + " · 连续编码重排，分数作排序主序；不可用时自动退回原融合排序")
+            : "未配置：设 L_NOTEPAD_RERANK_URL 指向本机 llama-server --reranking（未配置时检索行为与之前一致）";
+          const box = document.getElementById("rerank-model");
+          if (document.activeElement !== box) box.value = r.model || "";
+          document.getElementById("btn-rerank-toggle").textContent = r.enabled ? "关闭" : "开启";
+        }
+
+        function saveRerank(payload) {
+          fetch(root + "/api/search/rerank", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          }).then(function (x) { return x.json().then(function (j) { return { ok: x.ok, j: j }; }); })
+            .then(function (res) {
+              if (!res.ok) throw new Error((res.j && res.j.detail) || "HTTP 失败");
+              load();
+            })
+            .catch(function (e) { alert("保存失败：" + e.message); });
+        }
+        document.getElementById("btn-rerank-toggle").addEventListener("click", function () {
+          saveRerank({ enabled: !rerankCache.enabled });
+        });
+        document.getElementById("btn-rerank-model").addEventListener("click", function () {
+          saveRerank({ model: document.getElementById("rerank-model").value.trim() });
+        });
+
         function load() {
           return fetch(root + "/api/search/stats?deep=" + (deep ? 1 : 0), { cache: "no-store" })
             .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
@@ -301,6 +352,7 @@
               renderSources(d);
               renderVecModel(d);
               renderVec(d);
+              renderRerank(d);
               renderProgress(d);
               if (d.reindex && d.reindex.running) schedule();
               if (d.vec && d.vec.embed && d.vec.embed.running) schedule();
@@ -359,9 +411,12 @@
             .then(function (r) { return r.json(); })
             .then(function (d) {
               const v = d.vec || {};
+              const rr = d.rerank || {};
               document.getElementById("search-info").textContent =
                 "命中 " + d.total + " 条 · " + d.took_ms + "ms" + (d.fallback ? " · 精确短语无结果，已模糊匹配" : "") +
-                (v.used ? " · 语义命中 " + v.hits + "（" + (v.model || "") + "）" : "");
+                (v.used ? " · 语义命中 " + v.hits + "（" + (v.model || "") + "）" : "") +
+                (rr.used ? " · 重排 " + (rr.scored || 0) + " 块（" + (rr.took_ms || 0) + "ms）"
+                         : (rr.reason ? " · 未重排（" + rr.reason + "）" : ""));
               /* 结果渲染交给 static/app.js 的 LN.renderSearchHits：
                  与顶栏搜索弹窗共用同一份，样式/字段完全一致 */
               box.innerHTML = (window.LN && LN.renderSearchHits)

@@ -1,5 +1,40 @@
 # L Notepad 更新日志
 
+## v3.2.0 (2026-09-18)
+
+### 新增功能
+- 🔀 **本地交叉编码重排（rerank）**：融合排序之后再对候选块做 cross-encoder 重排，重排分作**排序主序**（原有 `score` 语义不变，重排分只作排序依据与独立字段）；后端走本机 llama.cpp `llama-server --reranking`（`POST /rerank`，失败自动试 `/v1/rerank`）
+  - 配置：`L_NOTEPAD_RERANK_URL`（必填，未设置=不启用）/ `L_NOTEPAD_RERANK_MODEL`（空=服务端默认）/ `L_NOTEPAD_RERANK_ENABLED`（默认开）/ `L_NOTEPAD_RERANK_TOP_N`（40）/ `L_NOTEPAD_RERANK_TIMEOUT_S`（3）
+  - 优先级：环境变量 > 页面设置（`app_settings.rerank_enabled` / `rerank_model`）> 默认，与 embedding 模型完全同构；URL 只读展示，不接受页面写入
+  - 候选：**每篇文档只投递 1 个块**（向量最优块 ∪ 词法候选文档的向量最优块），按融合分降序截断到 `TOP_N`；无块向量的文档不参与重排（保留原分与相对顺序，垫底）
+  - 降级：未配置 / 已关闭 / 冷却中 / 连不上 / 超时 / 返回结构不符 / 无候选块 → 本轮**退回原融合排序**，检索不报错、不返回空；连续失败 3 次进入 60s 冷却（冷却期内不发请求），探测结果缓存 60s，成功后自动恢复
+  - 单次对比：`GET /api/search?...&rerank=0` 临时关闭；全局关闭时传 `rerank=1` 也不生效
+- 🧩 **命中块（chunk）级信息**：命中项新增 `chunk` / `chunk_no` / `chunk_offset` / `rerank`，响应新增 `rerank: {used, model, scored, took_ms, reason}`；摘要**优先取自命中块**（块偏移 → 长前缀 / 首行查找 → 原有「短语优先 → 词块最密集窗口」回退），定位与偏移统一按 `\n` 归一化（CRLF 正文也对得上）；高亮仍在正文上产出、转义规则不变
+  - `vec_chunks` 新增块偏移列 `start`（启动幂等补列；旧行默认 0 → 走文本查找兜底，**无需重新嵌入**；要精确偏移可跑一次「全量重嵌」）
+  - 仅词法模式（`mode=lex`）同样返回块级信息：按同一套词法打分在块文本里挑最优块，**不额外发起 embedding 请求**
+- 🖥 状态页新增「重排（rerank）」区块：可用性 / 模型 / 候选上限与超时 / 最近耗时 / 连续失败与冷却 / 降级原因；管理员可开关与改模型；试搜信息行显示本轮是否重排、候选块数与耗时；结果卡片新增「重排」分与「块」标记
+
+### 接口
+- `GET /api/search`：新增查询参数 `rerank=0|1`（不传=按全局配置），命中项新增块级字段，响应新增 `rerank` 汇总（`vec` 段语义不变）
+- 新增 `GET /api/search/rerank`（状态）、`POST /api/search/rerank`（管理员，`{enabled?, model?}`）
+- `GET /api/search/stats` 新增 `rerank` 段（取不到时返回不可用状态，不影响其它字段）
+- `GET /api/kb/{kb}/search` 自动获得重排与块级字段（作用域、权限过滤不变）
+
+### 部署（可选）
+未部署重排服务时功能自动降级，检索行为与上一版**完全一致**。要启用：
+
+```
+llama-server --reranking -m bge-reranker-v2-m3.gguf --port 11435
+```
+
+然后在服务端设 `L_NOTEPAD_RERANK_URL=http://127.0.0.1:11435`（或只对单次请求带 `&rerank=1` 验证）。
+
+### 注意
+- 重排是**额外一次本地推理**：CPU 上 40 个候选块可能到几百毫秒，状态页「最近耗时」可作为调整 `L_NOTEPAD_RERANK_TOP_N` 的依据
+- 首次调用即探测；失败结果缓存 60s（避免每次检索都等超时），改配置或页面切换开关会清掉探测与冷却状态、立即重试
+
+---
+
 ## v3.1.0 (2026-09-17)
 
 ### 变更（索引源与构建时机）

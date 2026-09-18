@@ -258,6 +258,8 @@
       '<span class="sig main" title="命中词块相近程度：1.0 最集中（200 字符内）">近邻 <b>' + num(h.proximity, 2) + "</b>" +
       bar(h.proximity, " prox") + "</span>" +
       (h.vec ? '<span class="sig main" title="向量语义相似度（余弦）">语义 <b>' + num(h.vec, 3) + "</b></span>" : "") +
+      (h.rerank ? '<span class="sig main" title="交叉编码重排分（排序主序；0 = 本轮未参与重排）">重排 <b>' + num(h.rerank, 3) + "</b></span>" : "") +
+      (h.chunk ? '<span class="sig dim" title="命中的分块（第 ' + (h.chunk_no || 0) + " 块，正文偏移 " + (h.chunk_offset || 0) + '）">块</span>' : "") +
       sig("词频", num(h.tf, 2), "词块出现次数加权（单块封顶 5 次）", " dim") +
       sig("bm25", num(h.bm25, 2), "倒排引擎原始分（越负越相关，取负后计入总分）", " dim") +
       '<span class="sig dim when">' + esc((h.updated_at || "").replace("T", " ").slice(0, 16)) + "</span>" +
