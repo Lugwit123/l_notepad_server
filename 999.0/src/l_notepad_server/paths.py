@@ -13,9 +13,8 @@
     ├── notepad.sqlite3          服务端笔记库（backend_server 默认兜底位置）
     ├── account_favorites.json   账号收藏（原本就在此目录）
     ├── account_custom_fields.json
-    ├── .accounts_key            账号加密密钥
     ├── auth_token.json          登录令牌
-    └── remembered_login.json    「记住账号密码」勾选后回填的账号/明文密码
+    └── remembered_login.json    「记住账号」勾选后回填的用户名（密码不落盘，P5）
 
 Windows 文件系统大小写不敏感，~/.Lugwit 与已存在的 ~/.lugwit 是同一目录，
 账号数据无需搬迁。笔记/收藏夹等旧位置的数据在各访问函数首次调用时

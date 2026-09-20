@@ -2,6 +2,7 @@
 """网页端：/ 登录后的页面路由 + 登录/登出 API + 服务器日志查看页。"""
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -12,8 +13,10 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+from pytracemp import lprint
 
 from .. import auth as authmod
+from .. import depot_map
 from .. import file_store
 from .. import note_access
 from .. import search_index
@@ -131,7 +134,35 @@ async def auth_login(payload: LoginRequest, response: Response) -> dict[str, Any
         httponly=True,
         samesite="lax",
     )
+    _maybe_seed_depot_login(payload, data)
     return {"access_token": data["access_token"], "token_type": "bearer", "user": data["user"]}
+
+
+def _maybe_seed_depot_login(payload: LoginRequest, data: dict[str, Any]) -> None:
+    """管理员网页登录且服务进程尚无 depot 登录态 → 自动落机器凭据文件。
+
+    背景：depot KB 索引是**服务进程**的后台任务（无请求上下文），只认进程登录态；
+    网页登录者的 token 在各自浏览器里，服务进程拿不到。这里把管理员本次登录的
+    账号密码写成 `~/.lugwit/l_notepad_server/depot_auth.json`（0600，不入库不推送），
+    之后索引/云同步即用该身份；账号密码改了 → 旧凭据登录失败 → 下次管理员登录自动重播。
+    `LUGWIT_DEPOT_AUTO_SEED=0` 可关闭。
+    """
+    try:
+        if (os.environ.get("LUGWIT_DEPOT_AUTO_SEED", "1").strip() == "0"):
+            return
+        user_info = data.get("user") or {}
+        # 登录响应的 role 是角色名字符串（"admin"/"system"/"user"）；容错也收整数
+        role = user_info.get("role")
+        role_ok = role in (1, 2) or (
+            isinstance(role, str) and role.strip().lower() in ("admin", "system"))
+        if not role_ok:
+            return
+        if depot_map.configured_login_state():
+            return
+        path = depot_map.seed_login_state(payload.username, payload.password)
+        lprint(f"[l_notepad][login] 已用管理员登录自动配置 depot 登录态 -> {path}")
+    except Exception as exc:  # noqa: BLE001 —— 配置失败不阻断登录
+        lprint(f"[l_notepad][login] depot 登录态自动配置失败: {exc!r}")
 
 
 @router.post("/api/auth/logout")

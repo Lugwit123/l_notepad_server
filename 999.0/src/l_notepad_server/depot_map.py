@@ -48,16 +48,43 @@ def base_url() -> str:
 
 # ── 登录态 ──────────────────────────────────────────────
 # depot 服务（1028）每个请求都过 lugwit_auth 闸门（认 cookie lugwit_token / Bearer）。
-# 服务自带的「本机自动授权」实测会静默失败（访问日志只见 401），所以这里主动取：
-#   环境变量 LUGWIT_ACCESS_TOKEN > lugwit_auth 本机自动授权端点（同机部署时可用）
+# **不再有 `/api/v1/auth/auto` 回环兜底**（已按 P0 默认关闭），登录态只能来自：
+#   环境变量 LUGWIT_ACCESS_TOKEN（l_scheduler 登录后注入）
+#   > 环境变量 LUGWIT_USER/LUGWIT_PASSWORD
+#   > 机器本地凭据文件 ~/.lugwit/l_notepad_server/depot_auth.json（不入库、不推送）
 _AUTH_URL = os.environ.get("LUGWIT_AUTH_URL", "http://127.0.0.1:1027").strip().rstrip("/")
 _token_cache = {"value": ""}
+AUTH_FILE = Path.home() / ".lugwit" / "l_notepad_server" / "depot_auth.json"
 
 
-def _auto_token() -> str:
+def _file_auth() -> tuple[str, str]:
+    """读机器本地凭据文件（无则空串）。文件不存在/字段空都不算错误。"""
     try:
-        req = urllib.request.Request(_AUTH_URL + "/api/v1/auth/auto", method="POST")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+        return (str(data.get("lugwit_user") or "").strip(),
+                str(data.get("lugwit_password") or "").strip())
+    except FileNotFoundError:
+        return "", ""
+    except Exception:  # noqa: BLE001 —— 文件坏了不阻断服务，视为未配置
+        return "", ""
+
+
+def _login_token() -> str:
+    """用 LUGWIT_USER/LUGWIT_PASSWORD（env > 本地凭据文件）登录换 access_token。"""
+    user = os.environ.get("LUGWIT_USER", "").strip()
+    pwd = os.environ.get("LUGWIT_PASSWORD", "").strip()
+    if not (user and pwd):
+        user, pwd = _file_auth()
+    if not (user and pwd):
+        return ""
+    try:
+        req = urllib.request.Request(
+            _AUTH_URL + "/api/v1/auth/login",
+            data=json.dumps({"username": user, "password": pwd}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
             return str(json.loads(resp.read().decode("utf-8")).get("access_token") or "")
     except Exception:  # noqa: BLE001
         return ""
@@ -68,8 +95,48 @@ def _token(force: bool = False) -> str:
     if env:
         return env
     if force or not _token_cache["value"]:
-        _token_cache["value"] = _auto_token()
+        _token_cache["value"] = _login_token()
     return _token_cache["value"]
+
+
+def require_token(force: bool = False) -> str:
+    """取登录态；没有就抛 DepotError（**不静默发匿名请求**）。"""
+    tok = _token(force=force)
+    if not tok:
+        raise DepotError(
+            "depot 未配置登录态：请设置 LUGWIT_ACCESS_TOKEN（l_scheduler 会注入），"
+            "或 LUGWIT_USER/LUGWIT_PASSWORD 环境变量，"
+            f"或写入本地凭据文件 {AUTH_FILE}"
+            "（内容 {\"lugwit_user\": \"账号\", \"lugwit_password\": \"密码\"}；"
+            "管理员在网页登录一次也会自动写入；"
+            "回环自动授权已按 P0 关闭）"
+        )
+    return tok
+
+
+def configured_login_state() -> bool:
+    """服务进程是否已有可用的 depot 登录态（env token / env 账号密码 / 凭据文件）。"""
+    if os.environ.get("LUGWIT_ACCESS_TOKEN", "").strip():
+        return True
+    if (os.environ.get("LUGWIT_USER", "").strip()
+            and os.environ.get("LUGWIT_PASSWORD", "").strip()):
+        return True
+    user, pwd = _file_auth()
+    return bool(user and pwd)
+
+
+def seed_login_state(user: str, pwd: str) -> Path:
+    """把管理员网页登录的凭据落成机器本地凭据文件（0600，不入库不推送）。"""
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_FILE.write_text(
+        json.dumps({"lugwit_user": user, "lugwit_password": pwd},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    try:
+        os.chmod(AUTH_FILE, 0o600)
+    except OSError:
+        pass
+    return AUTH_FILE
 
 
 def http(
@@ -96,10 +163,9 @@ def http(
         headers["Content-Type"] = "application/json"
     elif body is not None:
         headers["Content-Type"] = "application/octet-stream"
-    tok = _token()
-    if tok:
-        headers["Cookie"] = "lugwit_token=" + tok
-        headers["Authorization"] = "Bearer " + tok
+    tok = require_token()
+    headers["Cookie"] = "lugwit_token=" + tok
+    headers["Authorization"] = "Bearer " + tok
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
