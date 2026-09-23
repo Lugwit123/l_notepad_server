@@ -41,6 +41,8 @@ SCAN_TTL_S = 5.0
 KB_SCAN_TTL_S = 300.0
 # 事件触发后的防抖窗口：连续多次提交合并成一次同步
 KB_DEBOUNCE_S = 1.0
+# 「重建历史」保留条数（search_history 表，状态页展示）
+HISTORY_KEEP = 200
 # 全量扫描/同步期间每处理多少篇提交一次（及时释放 SQLite 写锁，避免别的请求 database is locked）
 _COMMIT_EVERY = 25
 # 单次知识库同步的下载配额（html 文本，避免一轮把整库内容都读进内存）
@@ -630,17 +632,29 @@ def _kb_sync_one(conn, kb_name: str, *, progress: bool = False) -> int:
     return touched
 
 
-def sync_kb(conn, kb_name: str) -> int:
-    """同步单个知识库的归档索引（归档服务不可用只记状态，不抛给调用方）。"""
+def sync_kb(conn, kb_name: str, trigger: str = "") -> int:
+    """同步单个知识库的归档索引（归档服务不可用只记状态，不抛给调用方）。
+
+    `trigger`：`event`（提交/发布事件即时）/ `ticker`（TTL 兜底）/ `startup`（预热）。
+    仅在**有变化**或**失败**时记入历史，避免每 5 分钟的兜底空转刷屏。
+    """
+    started = time.monotonic()
     try:
         changed = _kb_sync_one(conn, kb_name)
     except Exception as exc:  # noqa: BLE001 - depot 不可用不该影响检索
+        msg = f"{type(exc).__name__}: {exc}"
         with _lock:
-            _kb_errors[kb_name] = f"{type(exc).__name__}: {exc}"
+            _kb_errors[kb_name] = msg
+        _record_history(conn, kind="kb_sync", target=kb_name, trigger=trigger,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        detail=f"失败: {msg}")
         return 0
     with _lock:
         _kb_errors.pop(kb_name, None)
         _kb_last_sync[kb_name] = time.monotonic()
+    if changed:
+        _record_history(conn, kind="kb_sync", target=kb_name, trigger=trigger, changed=changed,
+                        duration_ms=int((time.monotonic() - started) * 1000))
     return changed
 
 
@@ -675,7 +689,7 @@ def _kb_worker(db_path: Path, notes_root: Path) -> None:
             todo = kb_bases(conn) if (tick or "*" in names) else sorted(n for n in names if n != "*")
             while todo:   # 命中下载配额的知识库排到本轮末尾继续，不必等下一次 tick
                 name = todo.pop(0)
-                sync_kb(conn, name)
+                sync_kb(conn, name, trigger="event" if woke else "ticker")
                 with _lock:
                     more = name in _kb_more
                 if more:
@@ -728,22 +742,28 @@ def _warm_worker(db_path: Path, notes_root: Path) -> None:
         with _lock:
             _warm_state.update({"running": False, "error": f"{type(exc).__name__}: {exc}"})
         return
+    started = time.monotonic()
     try:
         updated = _refresh(conn, notes_root, force=True)
         with _lock:
             _warm_state["phase"] = "kb"
             _warm_state["updated"] = updated
         for name in kb_bases(conn):
-            updated += sync_kb(conn, name)
+            updated += sync_kb(conn, name, trigger="startup")
             with _lock:
                 _warm_state["updated"] = updated
         with _lock:
             rest = bool(_kb_more)   # 命中下载配额的库交给维护线程收尾
         if rest:
             notify_kb_change("")
+        _record_history(conn, kind="warm", trigger="startup", changed=updated,
+                        duration_ms=int((time.monotonic() - started) * 1000), detail="启动预热")
     except Exception as exc:  # noqa: BLE001
         with _lock:
             _warm_state["error"] = f"{type(exc).__name__}: {exc}"
+        _record_history(conn, kind="warm", trigger="startup",
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        detail=f"失败: {type(exc).__name__}: {exc}")
     finally:
         try:
             conn.close()
@@ -861,7 +881,11 @@ def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
 
 def reindex(conn, notes_root: Path) -> int:
     """同步重建全部索引（笔记目录 + 各知识库归档），返回写入/删除的索引行数。"""
-    return _rebuild(conn, notes_root)
+    started = time.monotonic()
+    touched = _rebuild(conn, notes_root)
+    _record_history(conn, kind="rebuild", trigger="manual", changed=touched, total=touched,
+                    duration_ms=int((time.monotonic() - started) * 1000), detail="同步重建全部索引")
+    return touched
 
 
 def start_reindex(db_path: Path, notes_root: Path) -> bool:
@@ -892,13 +916,19 @@ def _reindex_worker(db_path: Path, notes_root: Path) -> None:
     from . import db as dbmod
 
     conn = dbmod.connect(db_path)
+    started = time.monotonic()
     try:
         updated = _rebuild(conn, notes_root, progress=True)
         with _lock:
             _reindex_state["updated"] = updated
+        _record_history(conn, kind="rebuild", trigger="manual_async", changed=updated, total=updated,
+                        duration_ms=int((time.monotonic() - started) * 1000), detail="后台重建全部索引")
     except Exception as exc:  # noqa: BLE001 - 状态页展示错误即可
         with _lock:
             _reindex_state["error"] = f"{type(exc).__name__}: {exc}"
+        _record_history(conn, kind="rebuild", trigger="manual_async",
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        detail=f"失败: {type(exc).__name__}: {exc}")
     finally:
         try:
             conn.close()
@@ -913,6 +943,54 @@ def reindex_state() -> dict[str, Any]:
     """后台重建任务的当前状态快照（深拷贝，避免调用方读到半更新值）。"""
     with _lock:
         return dict(_reindex_state)
+
+
+# ── 重建/同步历史（search_history 表）─────────────────────
+
+
+def _record_history(conn, *, kind: str, target: str = "", trigger: str = "",
+                    changed: int = 0, total: int = 0, duration_ms: int = 0,
+                    detail: str = "") -> None:
+    """记录一次索引重建/同步事件（保留最近 HISTORY_KEEP 条）。
+
+    历史是旁路信息：任何异常都不应影响索引主流程。
+    """
+    try:
+        conn.execute(
+            "INSERT INTO search_history(at, kind, target, trigger, changed, total, duration_ms, detail)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(timespec="seconds"), kind, target, trigger,
+             int(changed), int(total), int(duration_ms), detail),
+        )
+        conn.execute(
+            "DELETE FROM search_history WHERE id NOT IN"
+            " (SELECT id FROM search_history ORDER BY id DESC LIMIT ?)",
+            (HISTORY_KEEP,),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 - 历史记录失败不影响索引
+        pass
+
+
+def history(conn, limit: int = 50) -> list[dict[str, Any]]:
+    """最近的索引重建/同步历史（倒序）。"""
+    try:
+        rows = conn.execute(
+            "SELECT id, at, kind, target, trigger, changed, total, duration_ms, detail"
+            " FROM search_history ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - 旧库未建表时返回空
+        return []
+    return [dict(r) for r in rows]
+
+
+def _history_total(conn) -> int:
+    """历史总条数。"""
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM search_history").fetchone()[0])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ── 状态统计 ────────────────────────────────────────────
@@ -1102,6 +1180,8 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
         "kb_pending": kb_pending,
         "warm": warm_state(),
         "reindex": reindex_state(),
+        "history": history(conn, limit=20),
+        "history_total": _history_total(conn),
         "deep": bool(deep),
     }
     if deep:

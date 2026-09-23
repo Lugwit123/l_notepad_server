@@ -165,6 +165,19 @@ def api_stats(
     return search_index.stats(conn, notes_root, deep=bool(deep))
 
 
+@router.get("/history")
+def api_history(
+    conn: sqlite3.Connection = Depends(get_conn),
+    limit: int = 50,
+) -> dict[str, Any]:
+    """索引重建/同步历史（倒序）：时间 / 类型 / 目标 / 触发源 / 变更数 / 耗时。
+
+    类型：`rebuild`（全量重建）/ `kb_sync`（知识库同步）/ `warm`（启动预热）；
+    触发源：`manual` / `manual_async` / `event` / `ticker` / `startup`。
+    """
+    return {"history": search_index.history(conn, limit=limit)}
+
+
 @router.post("/reindex")
 def api_reindex(
     request: Request,

@@ -132,6 +132,20 @@ CREATE TABLE IF NOT EXISTS search_docs (
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   title, body, note_path UNINDEXED, tokenize='unicode61 remove_diacritics 2'
 );
+
+-- 索引重建/同步历史（状态页「重建历史」用；保留最近若干条，见 search_index.HISTORY_KEEP）
+CREATE TABLE IF NOT EXISTS search_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,                   -- 事件时间（本地 ISO）
+  kind TEXT NOT NULL DEFAULT '',      -- rebuild（全量重建）/ kb_sync（知识库同步）/ warm（启动预热）
+  target TEXT NOT NULL DEFAULT '',    -- 知识库名（'' = 全部/笔记）
+  trigger TEXT NOT NULL DEFAULT '',   -- manual / manual_async / event / ticker / startup
+  changed INTEGER NOT NULL DEFAULT 0, -- 本次写入/删除的索引行数
+  total INTEGER NOT NULL DEFAULT 0,   -- 预计总量（重建时）
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT ''     -- 备注（失败原因等）
+);
+CREATE INDEX IF NOT EXISTS idx_search_history_at ON search_history(at);
 """
 
 

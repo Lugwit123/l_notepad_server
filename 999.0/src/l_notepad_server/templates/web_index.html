@@ -76,6 +76,17 @@
       </div>
 
       <div class="panel">
+        <h3>重建历史</h3>
+        <table>
+          <thead>
+            <tr><th>时间</th><th>类型</th><th>目标</th><th>触发</th><th>变更</th><th>耗时</th><th>备注</th></tr>
+          </thead>
+          <tbody id="hist-rows"></tbody>
+        </table>
+        <div class="muted" style="margin-top:8px;" id="hist-note"></div>
+      </div>
+
+      <div class="panel">
         <h3>语义检索（向量）</h3>
         <div class="row-actions" style="margin-bottom:10px;">
           <span class="muted">embedding 模型</span>
@@ -195,6 +206,24 @@
             "索引源 = 笔记目录（本机文件）+ 各知识库归档（depot 已上传内容，" +
             (d.workspace_exts || []).join(" / ") + "）；工作区本机目录不参与索引，" +
             "上传/提交后即时重建，另有 " + (d.kb_scan_ttl_s || "?") + "s 兜底扫描。";
+        }
+
+        function renderHistory(d) {
+          const hs = d.history || [];
+          const kindLabel = { rebuild: "全量重建", kb_sync: "知识库同步", warm: "启动预热" };
+          const trigLabel = { manual: "手动", manual_async: "手动(后台)", event: "事件", ticker: "兜底扫描", startup: "启动" };
+          const rows = hs.map(function (h) {
+            const bad = (h.detail || "").indexOf("失败") === 0;
+            return "<tr><td>" + esc(h.at) + "</td><td>" + esc(kindLabel[h.kind] || h.kind) +
+              '</td><td class="mono">' + esc(h.target || "—") + "</td><td>" + esc(trigLabel[h.trigger] || h.trigger) +
+              "</td><td>" + h.changed + "</td><td>" + h.duration_ms + "ms</td>" +
+              (bad ? '<td class="pill bad">' + esc(h.detail) + "</td>" : "<td>" + esc(h.detail || "") + "</td>") + "</tr>";
+          }).join("");
+          document.getElementById("hist-rows").innerHTML =
+            rows || '<tr><td colspan="7" class="muted">暂无重建记录</td></tr>';
+          document.getElementById("hist-note").textContent =
+            "共 " + (d.history_total || hs.length) + " 条（显示最近 " + hs.length + " 条）；" +
+            "全量重建、知识库同步（有变化/失败时）、启动预热都会记一条。";
         }
 
         function renderProgress(d) {
@@ -354,6 +383,7 @@
               renderVec(d);
               renderRerank(d);
               renderProgress(d);
+              renderHistory(d);
               if (d.reindex && d.reindex.running) schedule();
               if (d.vec && d.vec.embed && d.vec.embed.running) schedule();
               if (d.vec && d.vec.download && d.vec.download.running) schedule();
