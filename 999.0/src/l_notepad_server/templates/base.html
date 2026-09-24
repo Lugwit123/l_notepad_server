@@ -243,6 +243,7 @@
             <a class="app-nav-item {% if _rel == _web_rel %}active{% endif %}" href="{{ web_base }}"><span class="app-nav-ico">📋</span>笔记列表</a>
             <a class="app-nav-item {% if _rel == _web_rel + '/new' %}active{% endif %}" href="{{ web_base }}/new"><span class="app-nav-ico">✏️</span>新建笔记</a>
             <a class="app-nav-item {% if _rel == _kb_rel or _rel.startswith(_kb_rel + '/') %}active{% endif %}" href="{{ web_base }}/kb"><span class="app-nav-ico">📚</span>知识库</a>
+            <a class="app-nav-item {% if _rel == _web_rel + '/search' %}active{% endif %}" href="{{ web_base }}/search"><span class="app-nav-ico">🔍</span>全局搜索</a>
             <a class="app-nav-item {% if _rel == _web_rel + '/index' %}active{% endif %}" href="{{ web_base }}/index"><span class="app-nav-ico">🔎</span>搜索索引</a>
             {% if is_admin %}
             <div class="app-nav-sep"></div>
@@ -261,13 +262,17 @@
       </div>
 
       <div class="appbar-actions">
-        {# 全站统一搜索框：任何页面（含「搜索索引」页）都能搜「全部笔记 + 所有知识库工作区」。
-           回车提交到 web_base（= /web）走服务端倒排索引检索；web_list 另绑即时标题过滤。 #}
-        <form class="appbar-search" method="get" action="{{ web_base }}" role="search" aria-label="搜索全部笔记与知识库">
+        {# 全站统一搜索框：任何页面都能搜「全部笔记 + 所有知识库」。
+           回车提交到 /web/search（独立搜索页，mode=auto）；输入即弹窗显示命中。 #}
+        <form class="appbar-search" method="get" action="{{ web_base }}/search" role="search" aria-label="搜索全部笔记与知识库">
           <span class="search-icon">🔍</span>
           <input id="global-search-input" name="q" value="{{ q|default('', true)|e }}"
                  placeholder="搜索全部笔记 / 知识库…" aria-label="搜索" autocomplete="off"
+                 list="ln-search-history"
                  title="输入即弹窗显示命中（与「搜索索引」页同款结果）；回车看完整列表" />
+          {# mode=auto：先词法，零命中自动回退 hybrid，避免长句/自然语言显示"无命中" #}
+          <input type="hidden" name="mode" value="auto" />
+          <datalist id="ln-search-history"></datalist>
         </form>
         {% block appbar_actions %}{% endblock %}
       </div>
@@ -407,7 +412,7 @@
           var hits = (d && d.hits) || [];
           var head = '<div class="search-pop-head">命中 ' + ((d && d.total) || hits.length) + " 条" +
             (d && d.took_ms !== undefined ? " · " + Math.round(d.took_ms) + "ms" : "") +
-            '<a href="' + webBase + "?q=" + encodeURIComponent(q) + '">查看完整列表 →</a></div>';
+            '<a href="' + webBase + "/search?q=" + encodeURIComponent(q) + '&mode=auto">查看完整列表 →</a></div>';
           var body = (window.LN && LN.renderSearchHits)
             ? LN.renderSearchHits(hits)
             : (hits.map(function (h) {
@@ -422,7 +427,9 @@
           var q = (input.value || "").trim();
           if (!q) { closePop(); return; }
           var my = ++seq;
-          fetch(root + "/api/search?q=" + encodeURIComponent(q) + "&limit=8&mode=lex",
+          /* mode=auto：词法优先，零命中自动用 hybrid 语义兜底（长句/自然语言常见），
+             避免弹窗显示"无命中"；有词法命中时与原来的 lex 一样快。 */
+          fetch(root + "/api/search?q=" + encodeURIComponent(q) + "&limit=8&mode=auto",
                 { cache: "no-store" })
             .then(function (r) { return r.json(); })
             .then(function (d) { if (my === seq) render(d, q); })
@@ -461,6 +468,49 @@
       })();
     </script>
     {% endif %}
+    <script>
+      /* 搜索历史：localStorage 记最近 20 条，供顶栏输入框与搜索页的 datalist 共用；
+         全局暴露 window.lnSearchHistory，各页表单提交时写入。 */
+      (function () {
+        var KEY = "ln_search_history";
+        var MAX = 20;
+        function read() {
+          try { var a = JSON.parse(localStorage.getItem(KEY) || "[]"); return Array.isArray(a) ? a : []; }
+          catch (e) { return []; }
+        }
+        function fill() {
+          var html = read().map(function (v) {
+            return '<option value="' + String(v).replace(/"/g, "&quot;") + '"></option>';
+          }).join("");
+          ["ln-search-history", "ln-search-history-page"].forEach(function (id) {
+            var list = document.getElementById(id);
+            if (list) list.innerHTML = html;
+          });
+        }
+        function add(q) {
+          q = (q || "").trim();
+          if (!q) return;
+          var arr = read().filter(function (v) { return v !== q; });
+          arr.unshift(q);
+          arr = arr.slice(0, MAX);
+          try { localStorage.setItem(KEY, JSON.stringify(arr)); } catch (e) {}
+          fill();
+        }
+        window.lnSearchHistory = { read: read, add: add, fill: fill };
+        function init() {
+          fill();
+          var input = document.getElementById("global-search-input");
+          if (input && input.form) {
+            input.form.addEventListener("submit", function () { add(input.value); });
+          }
+        }
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", init);
+        } else {
+          init();
+        }
+      })();
+    </script>
     {% block body %}{% endblock %}
     <script src="{{ static_url(request, 'app.js') }}"></script>
     {% block page_script %}{% endblock %}

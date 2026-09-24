@@ -27,6 +27,7 @@ from .. import file_store
 from .. import knowledge as kb
 from .. import note_access
 from .. import search_index
+from .. import workspace_sync
 from .deps import (
     current_user,
     get_conn,
@@ -266,6 +267,7 @@ def api_kb_depot_save(
         raise _depot_error(exc) from exc
     # 归档基路径变了 → 旧索引里的 rel 全部失效，后台按新映射重同步该库
     search_index.notify_kb_change(kb_name)
+    workspace_sync.notify(kb_name)   # 归档基路径变了 → 下轮重新建基线
     return {"ok": True, **info}
 
 
@@ -554,6 +556,7 @@ def api_kb_workspace_file_write(
         target.write_text(payload.content, encoding="utf-8")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"写入失败：{exc}")
+    workspace_sync.notify(kb_name)   # 工作区已改 → 后台防抖后自动提交到版本库
     return {"ok": True, "rel": rel, "size": target.stat().st_size}
 
 
@@ -562,6 +565,7 @@ def api_kb_workspace_set(kb_name: str, payload: WorkspaceRequest, conn: sqlite3.
     if not kb.get_base(conn, kb_name):
         raise HTTPException(status_code=404, detail="知识库不存在")
     kb.set_workspace(conn, kb_name, payload.workspace)
+    workspace_sync.notify(kb_name)   # 工作区目录可能变了 → 下轮重新建基线
     return {"ok": True, **api_kb_workspace(kb_name, conn)}
 
 

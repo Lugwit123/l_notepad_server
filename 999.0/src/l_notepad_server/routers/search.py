@@ -8,20 +8,32 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from .. import search_index
 from .. import search_vec
-from .deps import current_user, get_conn, get_notes_root, is_admin, require_admin, web_base
+from .deps import (
+    current_user,
+    get_conn,
+    get_notes_root,
+    is_admin,
+    mounted_url,
+    require_admin,
+    web_base,
+)
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
 
 def _open_url(request: Request, hit: dict[str, Any]) -> str:
-    """命中项的前端打开地址：笔记 → 编辑页；知识库归档 → 知识库页并定位文档。"""
+    """命中项的前端打开地址：笔记 → 编辑页；知识库归档 → 知识库页；代码库 → 只读查看。"""
     rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
     if hit.get("source") == "kb":
         return f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={rel}"
+    if hit.get("source") == "code":
+        root = quote(str(hit.get("kb_name") or ""))
+        return f"{mounted_url(request, 'api/search/code/file')}?root={root}&file={rel}"
     return f"{web_base(request)}/{rel}"
 
 
@@ -42,27 +54,68 @@ def api_search(
     - 宽召回：中文按 bigram OR 召回，命中短语 > 覆盖率 > bm25 排序；
       查询里用 `"引号"` 包住可要求精确短语。
     - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库归档），默认全部。
-    - `mode`：`hybrid`（默认，词法 + 语义加分，词法空时语义兜底）/ `lex`（纯词法）/ `sem`（纯语义）。
+    - `mode`：`hybrid`（默认，词法 + 语义加分，词法空时语义兜底）/ `lex`（纯词法）
+      / `sem`（纯语义）/ `auto`（先 `lex`，零命中再回退 `hybrid`；返回多一个 `mode_used`）。
     - `rerank`：`0` 本次不用本地重排、`1` 使用（受全局配置约束），不传用全局配置。
     - 返回 hits：命中的来源、相对路径、打开地址 open_url、摘要、命中词 matches、
       块级信息 chunk / chunk_no / chunk_offset、覆盖率 / 词频 / 近邻 / bm25 / 语义相似度 vec /
       重排分 rerank / 总分 score，以及 rerank 汇总（是否使用 / 模型 / 条数 / 耗时 / 原因）。
     """
     src = [s.strip() for s in (sources or "").split(",") if s.strip()]
-    result = search_index.search(
-        conn,
-        notes_root,
-        q,
+    m = (mode or "hybrid").strip().lower()
+    common = dict(
         user=current_user(request),
         admin=is_admin(request),
         limit=limit,
         offset=offset,
         sources=src or None,
-        mode=(mode or "hybrid").strip().lower(),
         rerank=None if rerank is None else bool(rerank),
     )
+    if m == "auto":
+        result = search_index.search_auto(conn, notes_root, q, **common)
+    else:
+        result = search_index.search(conn, notes_root, q, mode=m, **common)
     hits = [{**h, "open_url": _open_url(request, h)} for h in result["hits"]]
     return {"query": q, "limit": limit, "offset": offset, **{**result, "hits": hits}}
+
+
+@router.get("/route")
+def api_route(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    notes_root: Path = Depends(get_notes_root),
+    q: str = "",
+    depth: int = 1,
+    budget_ms: int = 300,
+    limit: int = 10,
+    sources: str = "kb",
+) -> dict[str, Any]:
+    """快速选库：复杂需求 → 相关知识库排序（供 Agent 决定读哪几个库）。
+
+    - `depth`：`0` 仅库元数据匹配 / `1` 元数据 + 词法按库聚合（默认）/ `2` 语义加分
+      （需求嵌一次与库内文档向量比对；语义不可用自动降级为 `1`）/ `3` 不处理
+      （需求分解/多查询请调用方自行完成）。
+    - 与 `/api/search` 的区别：**不做段间 AND**（长需求不再零命中），且**只查索引表，
+      不触发语义探测 / 网络**——毫秒级返回；慢路径一律降级。
+    - `budget_ms`：软预算；`< 100` 时 `depth>=2` 自动退回 `1`（语义不做），并回填 `over_budget`。
+    - 返回 `kbs` 按 `score` 降序，`degraded` / `reason` / `reason_code` 说明是否降档及原因。
+    """
+    src = [s.strip() for s in (sources or "kb").split(",") if s.strip()]
+    budget = int(budget_ms or 0)
+    result = search_index.route(
+        conn,
+        notes_root,
+        q,
+        user=current_user(request),
+        admin=is_admin(request),
+        depth=depth,
+        limit=limit,
+        sources=src or None,
+        budget_ms=budget,
+    )
+    result["budget_ms"] = budget
+    result["over_budget"] = bool(budget) and result["took_ms"] > float(budget)
+    return result
 
 
 @router.post("/embed_async")
@@ -203,3 +256,71 @@ def api_reindex_async(
         "message": "已开始重建" if started else "重建已在运行中",
         "reindex": search_index.reindex_state(),
     }
+
+
+# ── 代码库索引（source=code）配置与查看 ────────────────────
+
+
+class CodeRootsRequest(BaseModel):
+    roots: list[str] = []
+
+
+@router.get("/code_roots")
+def api_code_roots(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """当前配置的代码库索引根目录（source=code）。"""
+    return {
+        "roots": [
+            {"label": lb, "root": str(rp), "exists": rp.is_dir()}
+            for lb, rp in search_index.code_roots(conn)
+        ],
+        "exts": sorted(search_index.CODE_EXTS),
+    }
+
+
+@router.put("/code_roots")
+def api_set_code_roots(
+    payload: CodeRootsRequest,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    notes_root: Path = Depends(get_notes_root),
+) -> dict[str, Any]:
+    """设置代码库索引根目录（管理员），随后触发一次后台重建纳入索引。
+
+    传空列表即清空（重建后 source=code 的索引行被移除）。
+    """
+    require_admin(request)
+    search_index.set_code_roots(conn, payload.roots)
+    started = search_index.start_reindex(request.app.state.db_path, notes_root)
+    return {
+        "ok": True,
+        "reindex_started": started,
+        "roots": [
+            {"label": lb, "root": str(rp), "exists": rp.is_dir()}
+            for lb, rp in search_index.code_roots(conn)
+        ],
+    }
+
+
+@router.get("/code/file")
+def api_code_file(
+    conn: sqlite3.Connection = Depends(get_conn),
+    root: str = "",
+    file: str = "",
+) -> PlainTextResponse:
+    """只读查看代码库文件（`source=code` 命中项的打开地址）；路径限定在已配置根内。"""
+    roots = {lb: rp for lb, rp in search_index.code_roots(conn)}
+    base = roots.get(root)
+    if base is None:
+        return PlainTextResponse("未知代码库: " + root, status_code=404)
+    try:
+        target = (base / file).resolve()
+        target.relative_to(base.resolve())
+    except (ValueError, OSError):
+        return PlainTextResponse("非法路径", status_code=400)
+    if not target.is_file():
+        return PlainTextResponse("文件不存在", status_code=404)
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return PlainTextResponse("读取失败: " + str(exc), status_code=500)
+    return PlainTextResponse(text)

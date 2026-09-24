@@ -35,6 +35,7 @@ from . import note_access
 from . import paths
 from . import search_index
 from . import search_vec
+from . import workspace_sync
 from .routers import accounts, admin, kb, logs, notes, search, web
 
 from pytracemp import lprint
@@ -162,6 +163,11 @@ def create_app(db_path: Path) -> FastAPI:
         search_index.warm_start(db_path, notes_root)
     except Exception as _e:  # noqa: BLE001 - 预热失败不影响启动
         lprint(f"[l_notepad] 搜索索引预热跳过: {_e}")
+    # 工作区改动自动提交到 depot（后台、防抖）：归档 → 索引的链路由此自动闭环
+    try:
+        workspace_sync.start(db_path)
+    except Exception as _e:  # noqa: BLE001 - 自动上传失败不影响启动
+        lprint(f"[l_notepad] 工作区自动上传未启动: {_e}")
     # 向量（语义检索）表：vec_docs / vec_chunks，未启 embedding 时只是空表
     try:
         search_vec.init_schema(conn)

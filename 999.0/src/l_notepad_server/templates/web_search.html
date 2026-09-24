@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}L Notepad - 全局搜索{% endblock %}
+{% block page_id %}search{% endblock %}
+{% block page_style %}
+      .srch { max-width: 1040px; margin: 0 auto; padding: 16px 14px 48px; }
+      .srch h2 { margin: 0 0 4px; font-size: 18px; }
+      .srch .hint { color: var(--muted); font-size: 12px; }
+      .srch-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 14px 0 6px; }
+      .srch-bar input.q {
+        flex: 1 1 320px; min-width: 200px; padding: 9px 12px; border-radius: 10px;
+        border: 1px solid var(--border); background: var(--panel); color: inherit; font-size: 14px;
+      }
+      .srch-bar input.q:focus { outline: none; border-color: var(--border-hover); }
+      .srch-bar select, .srch-bar .btn {
+        padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border);
+        background: var(--panel); color: inherit; font-size: 13px;
+      }
+      .srch-help-toggle {
+        display: inline-block; margin: 2px 0 10px; font-size: 12px; color: var(--muted);
+        cursor: pointer; user-select: none;
+      }
+      .help {
+        border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+        padding: 10px 14px; margin: 0 0 12px; font-size: 12.5px; line-height: 1.85;
+      }
+      .help summary { cursor: pointer; color: var(--muted); }
+      .help dt { font-weight: 600; margin-top: 8px; }
+      .help dd { margin: 0 0 2px; color: var(--muted); }
+      .help code { background: var(--panel-strong); padding: 1px 5px; border-radius: 5px; }
+      .mode-tip { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+      .srch-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0 10px; }
+      .chip {
+        display: inline-flex; gap: 5px; align-items: center; padding: 3px 9px; border-radius: 999px;
+        border: 1px solid var(--border); background: var(--panel); font-size: 12px; color: var(--muted);
+      }
+      .facets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+      .facet {
+        padding: 3px 10px; border-radius: 999px; font-size: 12px; text-decoration: none; color: inherit;
+        border: 1px solid var(--border); background: var(--panel-strong);
+      }
+      .facet:hover { border-color: var(--border-hover); }
+      .facet.active { border-color: #5b9cff; color: #8fb6ff; }
+      .facet.clear { color: var(--muted); }
+      .list { display: flex; flex-direction: column; gap: 10px; }
+      .card {
+        border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+        padding: 12px 14px; box-shadow: var(--shadow);
+      }
+      .card .row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+      .badge {
+        font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border);
+        white-space: nowrap; color: var(--muted);
+      }
+      .badge.kb { color: #8fb6ff; border-color: rgba(91,156,255,.4); }
+      .card .title { font-weight: 600; text-decoration: none; color: inherit; word-break: break-all; }
+      .card .title:hover { text-decoration: underline; }
+      .card .score { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+      .snippet { margin-top: 6px; font-size: 13px; line-height: 1.65; opacity: .92; word-break: break-word; }
+      .snippet mark { background: rgba(91,156,255,.30); color: inherit; border-radius: 3px; padding: 0 1px; }
+      .pager { display: flex; gap: 12px; align-items: center; margin-top: 18px; }
+      .empty { padding: 40px 8px; text-align: center; color: var(--muted); line-height: 2; }
+      .empty code { background: var(--panel-strong); padding: 1px 5px; border-radius: 5px; }
+{% endblock %}
+{% block body %}
+<div class="srch">
+  <h2>全局搜索</h2>
+  <div class="hint">一次搜索「我的笔记 + 所有知识库」。结果按相关度排序；下方「搜索帮助」解释每个参数与模式。</div>
+
+  <form class="srch-bar" method="get" action="{{ web_base }}/search">
+    <input class="q" type="text" name="q" value="{{ q|e }}" placeholder="输入关键词，搜索全部笔记与知识库…" autofocus autocomplete="off" list="ln-search-history-page">
+    <datalist id="ln-search-history-page"></datalist>
+    <select name="mode" title="检索模式">
+      <option value="auto" {% if mode == 'auto' %}selected{% endif %}>模式：自动</option>
+      <option value="lex" {% if mode == 'lex' %}selected{% endif %}>模式：仅词法</option>
+      <option value="hybrid" {% if mode == 'hybrid' %}selected{% endif %}>模式：混合</option>
+      <option value="sem" {% if mode == 'sem' %}selected{% endif %}>模式：仅语义</option>
+    </select>
+    <select name="sources" title="来源过滤">
+      <option value="" {% if not sources %}selected{% endif %}>来源：全部</option>
+      <option value="kb" {% if sources == 'kb' %}selected{% endif %}>来源：仅知识库</option>
+      <option value="code" {% if sources == 'code' %}selected{% endif %}>来源：仅代码库</option>
+      <option value="note" {% if sources == 'note' %}selected{% endif %}>来源：仅笔记</option>
+    </select>
+    <select name="kb" title="限定知识库">
+      <option value="">知识库：全部</option>
+      {% for b in kb_list %}
+      <option value="{{ b.name }}" {% if kb == b.name %}selected{% endif %}>{{ b.title or b.name }}{% if b.article_count is defined %}（{{ b.article_count }}）{% endif %}</option>
+      {% endfor %}
+    </select>
+    <select name="rerank" title="重排（需服务端已配置）">
+      <option value="" {% if rerank == '' %}selected{% endif %}>重排：默认</option>
+      <option value="1" {% if rerank == '1' %}selected{% endif %}>重排：开启</option>
+      <option value="0" {% if rerank == '0' %}selected{% endif %}>重排：关闭</option>
+    </select>
+    <select name="limit" title="每页条数">
+      {% for n in [20, 50, 100, 200] %}
+      <option value="{{ n }}" {% if limit == n %}selected{% endif %}>每页 {{ n }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn primary" type="submit">搜索</button>
+  </form>
+
+  {% if mode_help_current %}<div class="mode-tip">当前模式 —— {{ mode_help_current }}</div>{% endif %}
+
+  <details class="help">
+    <summary>搜索帮助：参数与模式说明</summary>
+    <dl>
+      <dt>检索模式 <code>mode</code></dt>
+      {% for k, v in mode_help.items() %}<dd><strong>{{ k }}</strong> —— {{ v }}</dd>{% endfor %}
+      <dt>来源 <code>sources</code></dt>
+      <dd><strong>全部</strong> 同时搜我的笔记与所有知识库；<strong>仅知识库</strong> 只看知识库归档；<strong>仅笔记</strong> 只看个人笔记。</dd>
+      <dt>知识库 <code>kb</code></dt>
+      <dd>把范围限定到某一个知识库（相当于「来源=仅知识库」再加库过滤）；点结果列表上方的库标签也能快速筛选。</dd>
+      <dt>重排 <code>rerank</code></dt>
+      <dd>用本机交叉编码器对候选块再排一次序，更准但更慢；服务端未配置时该项无效（<strong>默认</strong>即按全局配置）。</dd>
+      <dt>每页条数 / 分页 <code>limit · offset</code></dt>
+      <dd>每页可设 20/50/100/200；底部「上一页/下一页」翻页。</dd>
+      <dt>查询语法</dt>
+      <dd><code>空格</code>分段（段间 AND）；<code>"引号"</code>表示精确短语（无结果自动回退模糊）；单个汉字按前缀匹配；英文/数字按整词、大小写不敏感。</dd>
+      <dt>"自动"到底是什么</dt>
+      <dd><strong>auto = 先词法、零命中再语义</strong>：先用倒排索引（毫秒级）搜；只有当一条都没命中时，才自动改用语义检索兜底。既有词法命中就快，长句/自然语言也不会"无命中"，所以是默认推荐。</dd>
+    </dl>
+  </details>
+
+  {% if query %}
+    <div class="srch-meta">
+      <span class="chip">命中 <strong>{{ total }}</strong> 条</span>
+      <span class="chip">{{ '%.1f'|format(took_ms) }}ms</span>
+      {% if mode_used %}<span class="chip">实际模式 {{ mode_used }}</span>{% endif %}
+      <span class="chip">📝 笔记 {{ note_count }}</span>
+      <span class="chip">📚 知识库 {{ kb_count }}</span>
+      {% if fallback %}<span class="chip">精确短语无结果，已模糊匹配</span>{% endif %}
+      {% if vec_info and vec_info.used %}<span class="chip">语义命中 {{ vec_info.hits }}{% if vec_info.model %} · {{ vec_info.model }}{% endif %}</span>{% endif %}
+    </div>
+
+    {% if kb_facets %}
+    <div class="facets">
+      {% for f in kb_facets %}
+      <a class="facet {% if kb == f.kb_name %}active{% endif %}"
+         href="{{ web_base }}/search?q={{ q|urlencode }}&mode={{ mode }}&kb={{ f.kb_name|urlencode }}&limit={{ limit }}&rerank={{ rerank }}">{{ f.kb_name }} <strong>{{ f.count }}</strong></a>
+      {% endfor %}
+      {% if kb %}<a class="facet clear" href="{{ web_base }}/search?q={{ q|urlencode }}&mode={{ mode }}&limit={{ limit }}&rerank={{ rerank }}">✕ 清除库筛选</a>{% endif %}
+    </div>
+    {% endif %}
+
+    {% if hits_data %}
+    <div class="list" id="srch-hits"></div>
+    <script>window.__LN_SRCH_HITS = {{ hits_json|safe }};</script>
+
+    {% if total > limit %}
+    <div class="pager">
+      {% if has_prev %}<a class="btn" href="{{ web_base }}/search?q={{ q|urlencode }}&mode={{ mode }}&sources={{ sources }}&kb={{ kb|urlencode }}&rerank={{ rerank }}&limit={{ limit }}&offset={{ prev_offset }}">← 上一页</a>{% endif %}
+      <span class="hint">{{ shown_start }}–{{ shown_end }} / {{ total }}</span>
+      {% if has_next %}<a class="btn" href="{{ web_base }}/search?q={{ q|urlencode }}&mode={{ mode }}&sources={{ sources }}&kb={{ kb|urlencode }}&rerank={{ rerank }}&limit={{ limit }}&offset={{ next_offset }}">下一页 →</a>{% endif %}
+    </div>
+    {% endif %}
+    {% else %}
+    <div class="empty">未找到匹配的内容。<br>换个关键词，或把模式调成「自动 / 混合」再试。</div>
+    {% endif %}
+  {% else %}
+    <div class="empty">
+      输入关键词开始搜索 —— 结果覆盖<strong>全部知识库</strong>与<strong>我的笔记</strong>。<br>
+      提示：<code>"精确短语"</code>；模式「自动」最省心（词法优先，零命中自动用语义兜底）。
+    </div>
+  {% endif %}
+</div>
+{% endblock %}
+{% block page_script %}
+<script>
+  (function () {
+    /* 结果卡片复用 app.js 的 LN.renderSearchHits（与顶栏弹窗/「搜索索引」页同款：
+       含覆盖/近邻/语义/块/词频/bm25/时间等打分明细），保证三处样式与参数一致 */
+    var box = document.getElementById("srch-hits");
+    var data = window.__LN_SRCH_HITS || [];
+    if (box) {
+      if (window.LN && LN.renderSearchHits) {
+        box.innerHTML = LN.renderSearchHits(data);
+      } else {
+        box.innerHTML = data.map(function (h) {
+          return '<div class="hit"><div class="hit-head"><a href="' + (h.open_url || "#") + '">' +
+            (h.source === "kb" ? "📚 " : "📝 ") + (h.rel || "") + "</a></div></div>";
+        }).join("") || '<div class="empty">结果渲染器 app.js 未加载</div>';
+      }
+    }
+    /* 本页搜索表单提交时写入搜索历史（与顶栏共用 window.lnSearchHistory） */
+    var form = document.querySelector(".srch-bar");
+    var inp = form && form.querySelector("input.q");
+    if (form && inp) {
+      form.addEventListener("submit", function () {
+        if (window.lnSearchHistory) window.lnSearchHistory.add(inp.value);
+      });
+    }
+  })();
+</script>
+{% endblock %}

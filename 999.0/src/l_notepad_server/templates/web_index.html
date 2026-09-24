@@ -117,11 +117,26 @@
       </div>
 
       <div class="panel">
+        <h3>代码库索引（本机目录，source=code）</h3>
+        <div class="row-actions" style="margin-bottom:10px;">
+          <span class="muted">每行一个绝对目录（保存后自动后台重建索引）；命中可按「仅代码库」过滤，结果点开为只读查看。</span>
+        </div>
+        <textarea class="q" id="code-roots" rows="3"
+                  style="width:100%; font-family:Consolas,Menlo,monospace; font-size:12px;"
+                  placeholder="D:\path\to\repo" {% if not is_admin %}disabled{% endif %}></textarea>
+        <div class="row-actions" style="margin-top:10px;">
+          <button class="btn sm primary" type="button" id="btn-code-roots" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>保存并重建</button>
+          <span class="muted" id="code-roots-hint"></span>
+        </div>
+      </div>
+
+      <div class="panel">
         <h3>试搜（走同一套倒排索引）</h3>
         <div class="row-actions">
           <input class="q" id="q" placeholder="输入关键词，回车搜索…（&quot;引号&quot; 表示精确短语）" />
           <select class="q" id="mode" style="flex:0 0 auto; width:120px;">
             <option value="hybrid">混合</option>
+            <option value="auto">自动</option>
             <option value="lex">仅词法</option>
             <option value="sem">仅语义</option>
           </select>
@@ -459,6 +474,39 @@
         document.getElementById("q").addEventListener("keydown", function (e) {
           if (e.key === "Enter") { e.preventDefault(); doSearch(); }
         });
+
+        // ── 代码库索引（source=code）：配置本机目录，保存后自动后台重建 ──
+        const codeRootsBox = document.getElementById("code-roots");
+        const codeHint = document.getElementById("code-roots-hint");
+        function loadCodeRoots() {
+          fetch(root + "/api/search/code_roots", { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (codeRootsBox) codeRootsBox.value = (d.roots || []).map(function (x) { return x.root; }).join("\n");
+              if (codeHint) codeHint.textContent = "已配置 " + (d.roots || []).length + " 个目录";
+            })
+            .catch(function () {});
+        }
+        const codeBtn = document.getElementById("btn-code-roots");
+        if (codeBtn) codeBtn.addEventListener("click", function () {
+          const roots = (codeRootsBox.value || "").split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+          codeBtn.disabled = true;
+          fetch(root + "/api/search/code_roots", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ roots: roots }),
+          })
+            .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+            .then(function (res) {
+              codeBtn.disabled = false;
+              if (!res.ok) { if (codeHint) codeHint.textContent = "保存失败：" + (res.d.detail || res.d); return; }
+              if (codeHint) codeHint.textContent = "已保存 " + res.d.roots.length + " 个目录，" +
+                (res.d.reindex_started ? "后台重建中…" : "重建已在运行") + "（稍后刷新本页看索引）";
+              loadCodeRoots();
+            })
+            .catch(function (e) { codeBtn.disabled = false; if (codeHint) codeHint.textContent = "保存失败：" + e; });
+        });
+        loadCodeRoots();
 
         load();
       })();

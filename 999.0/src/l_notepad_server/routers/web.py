@@ -2,6 +2,7 @@
 """网页端：/ 登录后的页面路由 + 登录/登出 API + 服务器日志查看页。"""
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -18,6 +19,7 @@ from pytracemp import lprint
 from .. import auth as authmod
 from .. import depot_map
 from .. import file_store
+from .. import knowledge as kbmod
 from .. import note_access
 from .. import search_index
 from .deps import (
@@ -34,6 +36,14 @@ from .deps import (
 router = APIRouter(tags=["web"])
 
 _TAG_SPLIT = re.compile(r"[,，;；]+")
+
+# 搜索模式说明（/web/search 帮助面板；键顺序即下拉顺序）
+MODE_HELP: dict[str, str] = {
+    "auto": "自动：先用词法搜（毫秒级），一条都没命中时才改用语义兜底。最省心，长句/自然语言推荐。",
+    "lex": "仅词法：倒排索引精确匹配关键词，最快；适合关键词明确，长句可能搜不到。",
+    "hybrid": "混合：词法为主 + 语义加分，召回更广；较慢（本机无 embedding 时可能数秒）。",
+    "sem": "仅语义：按“意思相近”匹配，不看关键词是否出现；可能召回噪声，适合换词也找不到时。",
+}
 
 
 def _parse_tags(raw: Any) -> list[str]:
@@ -109,12 +119,20 @@ def _hit_view(request: Request, hit: dict[str, Any], brief: list[file_store.File
     )
 
 
+def _hit_open_url(request: Request, hit: dict[str, Any]) -> str:
+    """命中项的前端打开地址（与 routers/search.py 的 `_open_url` 保持一致）。"""
+    rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
+    if hit.get("source") == "kb":
+        return f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={rel}"
+    if hit.get("source") == "code":
+        root = quote(str(hit.get("kb_name") or ""))
+        return f"{mounted_url(request, 'api/search/code/file')}?root={root}&file={rel}"
+    return f"{web_base(request)}/{rel}"
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
-
-
-# ── 登录 / 登出（认证走 Auth Service；cookie 由服务端设置，HttpOnly 防 XSS 窃取）──
 
 
 @router.post("/api/auth/login")
@@ -204,6 +222,144 @@ def web_index_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request, "web_index.html", {**template_ctx(request)})
 
 
+# ── 全局搜索页（笔记 + 所有知识库）── 同样必须在 /web/{note_path:path} 之前注册
+
+
+@router.get("/web/search", response_class=HTMLResponse)
+def web_search(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    q: str = "",
+    mode: str = "auto",
+    sources: str = "",
+    kb: str = "",
+    rerank: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> HTMLResponse:
+    """独立搜索页：一次搜「个人笔记 + 所有知识库归档」。
+
+    参数：`q` 关键词；`mode` auto/lex/hybrid/sem；`sources` note/kb（逗号分隔）；
+    `kb` 指定单个知识库（隐含 `sources=kb`）；`rerank` 0/1（受全局配置约束）；
+    `limit`/`offset` 分页。检索一次取到上限（MAX_LIMIT=500）后在服务端切片，便于分面统计。
+    """
+    templates = get_templates(request)
+    query = (q or "").strip()
+    src = [s.strip() for s in (sources or "").split(",") if s.strip() in ("note", "kb", "code")]
+    kb_name = (kb or "").strip()
+    if kb_name:
+        src = ["kb"]
+    lim = max(1, min(int(limit or 100), 200))
+    off = max(0, int(offset or 0))
+    m = (mode or "auto").strip().lower()
+    if m not in MODE_HELP:
+        m = "auto"
+    # rerank 用字符串接收：表单未选时提交空串，Optional[int] 会 int_parsing 报错
+    rerank_raw = (rerank or "").strip()
+    rr: bool | None = None
+    if rerank_raw != "":
+        try:
+            rr = bool(int(rerank_raw))
+        except ValueError:
+            rr = None
+
+    hits: list[SearchHitView] = []
+    page_raw: list[dict[str, Any]] = []
+    total = 0
+    took_ms = 0.0
+    fallback = False
+    mode_used = ""
+    vec_info: dict[str, Any] = {}
+    kb_facets: list[dict[str, Any]] = []
+    note_count = 0
+    kb_count = 0
+    shown_end = 0
+
+    if query:
+        common = dict(
+            user=current_user(request),
+            admin=is_admin(request),
+            limit=search_index.MAX_LIMIT,
+            offset=0,
+            sources=src or None,
+            rerank=rr,
+            kb_name=kb_name,
+        )
+        if m == "auto":
+            result = search_index.search_auto(conn, request.app.state.notes_root, query, **common)
+            mode_used = result.get("mode_used", "")
+        else:
+            result = search_index.search(conn, request.app.state.notes_root, query, mode=m, **common)
+            mode_used = m
+        total = int(result.get("total") or 0)
+        took_ms = float(result.get("took_ms") or 0.0)
+        fallback = bool(result.get("fallback"))
+        vec_info = dict(result.get("vec") or {})
+        brief = accessible_brief(request, conn, limit=500)
+        all_views = [_hit_view(request, h, brief) for h in result.get("hits") or []]
+        counter: dict[str, int] = {}
+        for h in all_views:
+            if h.source == "kb":
+                kb_count += 1
+                if h.kb_name:
+                    counter[h.kb_name] = counter.get(h.kb_name, 0) + 1
+            else:
+                note_count += 1
+        kb_facets = [
+            {"kb_name": k, "count": c}
+            for k, c in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        hits = all_views[off : off + lim]
+        shown_end = off + len(hits)
+        # 原始命中（含全部打分明细）→ 前端复用 LN.renderSearchHits 渲染「丰富参数」卡片
+        raw_hits = result.get("hits") or []
+        page_raw = [
+            {**h, "open_url": _hit_open_url(request, h)}
+            for h in raw_hits[off : off + lim]
+        ]
+
+    try:
+        kb_list = kbmod.list_bases(conn)
+    except Exception:  # noqa: BLE001 知识库表缺失/异常时不阻断搜索页
+        kb_list = []
+
+    return templates.TemplateResponse(
+        request,
+        "web_search.html",
+        {
+            "q": q,
+            "query": query,
+            "mode": m,
+            "mode_help": MODE_HELP,
+            "mode_help_current": MODE_HELP.get(m, ""),
+            "mode_used": mode_used,
+            "sources": ",".join(src),
+            "kb": kb_name,
+            "kb_list": kb_list,
+            "rerank": rerank_raw,
+            "hits": hits,
+            "hits_data": page_raw,
+            "hits_json": json.dumps(page_raw, ensure_ascii=False).replace("<", "\\u003c"),
+            "total": total,
+            "took_ms": took_ms,
+            "fallback": fallback,
+            "vec_info": vec_info,
+            "kb_facets": kb_facets,
+            "note_count": note_count,
+            "kb_count": kb_count,
+            "limit": lim,
+            "offset": off,
+            "shown_start": off + 1 if hits else 0,
+            "shown_end": shown_end,
+            "has_prev": off > 0,
+            "has_next": shown_end < total,
+            "prev_offset": max(0, off - lim),
+            "next_offset": off + lim,
+            **template_ctx(request),
+        },
+    )
+
+
 # ── 笔记列表 / 新建 / 编辑 ──
 
 
@@ -212,6 +368,7 @@ def web_list(
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
     q: str = "",
+    mode: str = "",
 ) -> HTMLResponse:
     templates = get_templates(request)
     notes = accessible_brief(request, conn, limit=500)
@@ -225,17 +382,33 @@ def web_list(
     groups = _groups_from_notes(notes)
     query = (q or "").strip()
     fallback = False
+    mode_used = ""
     if query:
         # 走 FTS5 倒排索引检索（毫秒级），不再逐文件读全文；命中行按相关度排序。
-        # 同时含个人笔记与知识库工作区命中，各自给出可打开的 url
-        result = search_index.search(
-            conn,
-            request.app.state.notes_root,
-            query,
-            user=current_user(request),
-            admin=is_admin(request),
-            limit=500,
-        )
+        # 同时含个人笔记与知识库归档命中，各自给出可打开的 url。
+        # `mode=auto`（顶栏表单默认）：先词法，零命中再回退 hybrid，避免长句显示"无命中"。
+        m = (mode or "hybrid").strip().lower()
+        if m == "auto":
+            result = search_index.search_auto(
+                conn,
+                request.app.state.notes_root,
+                query,
+                user=current_user(request),
+                admin=is_admin(request),
+                limit=500,
+            )
+            mode_used = result.get("mode_used", "")
+        else:
+            result = search_index.search(
+                conn,
+                request.app.state.notes_root,
+                query,
+                user=current_user(request),
+                admin=is_admin(request),
+                limit=500,
+                mode=m,
+            )
+            mode_used = m
         notes = [_hit_view(request, h, notes) for h in result["hits"]]
         fallback = bool(result.get("fallback"))
     return templates.TemplateResponse(
@@ -244,6 +417,8 @@ def web_list(
         {
             "notes": notes,
             "q": q,
+            "mode": mode,
+            "mode_used": mode_used,
             "fallback": fallback,
             "active_note_path": None,
             "owned_paths": note_access.list_owned_by(conn, current_user(request)),

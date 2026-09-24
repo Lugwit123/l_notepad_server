@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -525,6 +526,15 @@ def init_schema(conn) -> None:
           vec BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_vec_chunks_doc ON vec_chunks(doc_key);
+        -- 库摘要向量（选库路由 depth=2 用）：库名 → 摘要向量，避免每次扫全部块
+        CREATE TABLE IF NOT EXISTS kb_vec (
+          kb_name TEXT PRIMARY KEY,
+          model TEXT NOT NULL DEFAULT '',
+          dim INTEGER NOT NULL DEFAULT 0,
+          text TEXT NOT NULL DEFAULT '',
+          vec BLOB NOT NULL,
+          updated_at TEXT NOT NULL
+        );
         """
     )
     _ensure_column(conn, "vec_docs", "rev", "rev INTEGER NOT NULL DEFAULT 0")
@@ -779,6 +789,131 @@ def _best_chunks(conn, query: str, *, limit: int) -> list[tuple[str, int, float]
 def search(conn, query: str, *, limit: int = 50) -> list[tuple[str, float]]:
     """语义检索：返回 [(doc_key, 相似度)]，按相似度降序（每篇取最高分块）。"""
     return [(k, score) for k, _no, score in _best_chunks(conn, query, limit=limit)]
+
+
+def _probe_embed(timeout: float = 0.3) -> bool:
+    """快速 TCP 探测 embedding 服务是否可达。
+
+    选库路由 depth=2 必须快：ollama 不可达时 `embed_texts` 会卡在 HTTP 长超时
+    （这也是 hybrid 无 ollama 时约 6s 的原因）。先做 0.3s 建连探测，不可达立即放弃。
+    """
+    try:
+        from urllib.parse import urlparse
+
+        u = urlparse(EMBED_URL)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:  # noqa: BLE001 不可达 / DNS / 超时一律视为不可用
+        return False
+
+
+def _kb_meta_texts(conn) -> list[tuple[str, str]]:
+    """[(kb_name, meta_text)]：name + title + description（库摘要文本）。"""
+    try:
+        from . import knowledge
+
+        bases = knowledge.list_bases(conn)
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple[str, str]] = []
+    for b in bases:
+        name = str(b.get("name") or "")
+        text = " ".join(
+            (name, str(b.get("title") or ""), str(b.get("description") or ""))
+        ).strip()
+        out.append((name, text or name))
+    return out
+
+
+def _kb_doc_centroid(conn, kb_name: str, mdl: str) -> tuple[float, ...] | None:
+    """该库已嵌入文档的块向量均值（归一化）；无则 None。"""
+    rows = conn.execute(
+        "SELECT c.vec AS vec FROM vec_chunks c JOIN vec_docs d ON d.doc_key = c.doc_key"
+        " WHERE d.kb_name = ? AND d.model = ?",
+        (kb_name, mdl),
+    ).fetchall()
+    if not rows:
+        return None
+    acc: list[float] | None = None
+    for r in rows:
+        v = _unpack(r["vec"])
+        if acc is None:
+            acc = [0.0] * len(v)
+        for i, x in enumerate(v):
+            acc[i] += x
+    n = len(rows)
+    return _normalize([x / n for x in acc])
+
+
+def _kb_vec_load(conn, kb_name: str, mdl: str) -> tuple[float, ...] | None:
+    row = conn.execute(
+        "SELECT vec FROM kb_vec WHERE kb_name = ? AND model = ?", (kb_name, mdl)
+    ).fetchone()
+    return _unpack(row["vec"]) if row else None
+
+
+def _kb_vec_build(conn, kb_name: str, meta_text: str, mdl: str) -> tuple[float, ...] | None:
+    """库摘要向量 = 归一化(0.5*元数据向量 + 0.5*文档质心)；缺一用另一；都无 → None。"""
+    try:
+        meta_vec: tuple[float, ...] | None = _normalize(embed_texts([meta_text], mdl)[0])
+    except Exception:  # noqa: BLE001
+        meta_vec = None
+    centroid = _kb_doc_centroid(conn, kb_name, mdl)
+    if meta_vec and centroid:
+        vec = _normalize([0.5 * a + 0.5 * b for a, b in zip(meta_vec, centroid)])
+    else:
+        vec = meta_vec or centroid
+    if vec is None:
+        return None
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO kb_vec(kb_name, model, dim, text, vec, updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (kb_name, mdl, len(vec), meta_text, _pack(vec), _now()),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 缓存写失败不影响本次返回
+        pass
+    return vec
+
+
+def _kb_vec_ensure(conn, kb_name: str, meta_text: str, mdl: str) -> tuple[float, ...] | None:
+    vec = _kb_vec_load(conn, kb_name, mdl)
+    if vec is not None:
+        return vec
+    return _kb_vec_build(conn, kb_name, meta_text, mdl)
+
+
+def kb_semantic_scores(
+    conn, query: str, *, probe_s: float = 0.3, max_kbs: int = 200
+) -> dict[str, float]:
+    """按**知识库**聚合的语义得分：{kb_name: 需求与该库摘要向量余弦}。
+
+    查询只嵌一次，再与各库**预建摘要向量**点积（O(库数)，不扫全部块）。
+    不可用 / 不可达 / 无向量时返回 `{}`（**绝不阻塞**，供选库路由 depth=2 降级）。
+    """
+    if not enabled() or not (query or "").strip():
+        return {}
+    mdl = model(conn)
+    if not mdl:
+        return {}
+    if not _probe_embed(probe_s):
+        return {}
+    try:
+        qvec = _normalize(embed_texts([query_text(query, mdl)], mdl)[0])
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, float] = {}
+    for kb_name, meta_text in _kb_meta_texts(conn)[:max_kbs]:
+        vec = _kb_vec_ensure(conn, kb_name, meta_text, mdl)
+        if vec is None:
+            continue
+        score = _dot(qvec, vec)
+        if score > 0:
+            out[kb_name] = round(score, 4)
+    return out
 
 
 def search_chunks(conn, query: str, *, limit: int = 50) -> list[tuple[str, int, int, str, float]]:

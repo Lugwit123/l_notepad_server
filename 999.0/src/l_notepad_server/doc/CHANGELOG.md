@@ -1,5 +1,13 @@
 # L Notepad 更新日志
 
+## v3.3.0 (2026-09-24)
+
+### 新增功能
+- 🔎 **快速选库路由 `GET /api/search/route`**：一段复杂需求 → 知识库级排序（`depth` 0 元数据 / 1 词法按库聚合 / 2 语义摘要向量 / 3 交回 Agent）；毫秒级，带 `budget_ms` 降级、`reason_code` 与结果缓存
+- 🗂 **独立全局搜索页 `GET /web/search`**：一次搜「笔记 + 全部知识库 + 代码库」；参数 `mode(auto/lex/hybrid/sem) / sources / kb / rerank / limit / offset`、知识库分面、搜索帮助面板、搜索历史（localStorage）、结果卡片复用 `LN.renderSearchHits`（顶栏弹窗回车 → 此页）
+- 🧩 **代码库索引（`source=code`）**：`GET/PUT /api/search/code_roots`（管理员，运行时配置本机目录，保存后自动后台重建）、`GET /api/search/code/file` 只读查看；状态页新增「代码库索引」卡片；扫描按 `CODE_EXTS` 过滤并跳过 `.git/__pycache__/node_modules/...`
+- 🔤 `/api/search?mode=auto`：先词法，零命中再回退 hybrid（长句/自然语言不再"无命中"）
+
 ## v3.2.0 (2026-09-18)
 
 ### 新增功能

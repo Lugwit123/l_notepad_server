@@ -24,6 +24,8 @@
 """
 from __future__ import annotations
 
+import math
+import os
 import re
 import threading
 import time
@@ -70,6 +72,38 @@ _VEC_REL = 0.15    # 相对窗口：只保留与最高分相差不超过该值�
 # 知识库工作区可索引的文本类扩展名（与 routers/kb.py 的浏览白名单一致）
 WORKSPACE_EXTS = {".md", ".markdown", ".txt", ".rst", ".log"}
 
+# 代码库索引（source="code"，见 code_roots / _scan_code）：可索引的代码/配置扩展名
+CODE_EXTS = WORKSPACE_EXTS | {
+    ".py", ".pyi", ".ui", ".qss", ".bat", ".cmd", ".ps1", ".sh",
+    ".toml", ".yaml", ".yml", ".ini", ".cfg", ".json",
+    ".js", ".ts", ".tsx", ".jsx", ".html", ".css",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".java", ".rs", ".go",
+}
+# 代码库扫描跳过的目录名（依赖 / 构建产物 / 缓存 / VCS）
+CODE_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    ".idea", ".vscode", "dist", "build", "target", ".mypy_cache", ".pytest_cache",
+    ".tox", ".next", ".cache", ".gradle", "site-packages",
+}
+# 代码库根目录（换行/分号分隔的绝对路径）持久化在 app_settings
+SETTING_CODE_ROOTS = "code_roots"
+
+# 选库路由（route）：关键词块上限 + 打分权重（见 route()）
+_ROUTE_MAX_TERMS = 40    # 关键词块上限，防超长需求拖慢
+_ROUTE_W_DOCS = 0.5      # 库内命中量（log1p，弱权重，防大库霸榜）
+_ROUTE_W_META = 2.5      # 库名/标题/描述命中（元数据信号）
+_ROUTE_W_VEC = 1.5       # 库摘要语义相似度（depth>=2）
+_ROUTE_W_BM25 = 1.5      # 库内最优 bm25（自带宽 IDF，压低高频泛词）
+_ROUTE_BM25_SCALE = 20.0  # bm25 → (-1,1) 的 tanh 尺度（避免原始分主导）
+# 结果缓存：Agent 常重发同一需求；短 TTL 直接命中（改索引后最多陈旧一会儿）
+_ROUTE_CACHE_TTL = 10.0
+_ROUTE_CACHE_MAX = 200
+# 选库路由剔除的低信息单字：「的」「了」这类 bigram 会带来大量噪声召回
+_ROUTE_STOP_CHARS = set(
+    "的了是在和与或这那之其也就都还而并且把被为对从到很会能可要需请吧吗呢啊呀哦嗯"
+    "我你他她它们个来去做用以于上下中里外前后时"
+)
+
 _HAN = r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
 _SEG_RE = re.compile(f'("{_HAN}+"|{_HAN}+|[0-9A-Za-z]+)')
 
@@ -89,6 +123,9 @@ _PERM_SQL = """
     OR (
       search_docs.source = 'kb'
       AND EXISTS (SELECT 1 FROM knowledge_bases kb WHERE kb.name = search_docs.kb_name)
+    )
+    OR (
+      search_docs.source = 'code'
     )
   )
 """
@@ -216,6 +253,44 @@ def build_match_expr(units: list[dict[str, str]]) -> str:
         terms = [term(u) for u in g]
         parts.append("(" + " OR ".join(terms) + ")" if len(terms) > 1 else terms[0])
     return " AND ".join(parts)
+
+
+def _route_stop_bigram(t: str) -> bool:
+    """含任一低信息单字的 bigram 视为噪声（如「需要」「一个」）。"""
+    return any(ch in _ROUTE_STOP_CHARS for ch in t)
+
+
+def route_terms(query: str, *, limit: int = _ROUTE_MAX_TERMS) -> list[str]:
+    """选库路由用的关键词块：中文二元 OR（剔除低信息 bigram）+ 英文整词；去重保序。
+
+    与 `parse_query` 的关键区别：**不做段间 AND**——复杂长需求按段间 AND 会直接
+    零命中（这正是 `/api/search` 对长句失效的原因）；这里全部 OR 召回，再按覆盖打分。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _SEG_RE.finditer(query or ""):
+        seg = m.group(0).strip('"')
+        if not seg:
+            continue
+        if seg[0].isascii():
+            toks = [seg.lower()]
+        elif len(seg) == 1:
+            continue    # 单字前缀召回噪声大，选库不用
+        else:
+            toks = [seg[i : i + 2] for i in range(len(seg) - 1)]
+            toks = [t for t in toks if not _route_stop_bigram(t)]
+        for t in toks:
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def route_match_expr(terms: list[str]) -> str:
+    """选库路由的 FTS5 表达式：全部关键词块 **OR** 召回（无段间 AND）。"""
+    return " OR ".join(f'"{t}"' for t in terms if t)
 
 
 def highlight(text: str, matches: list[str], limit: int = 200) -> str:
@@ -555,6 +630,105 @@ def _bump_progress() -> None:
         _reindex_state["done"] = int(_reindex_state.get("done", 0)) + 1
 
 
+# ── 代码库索引源：本机目录（source="code"）──────────────────
+#
+# 与笔记/知识库并列的第三类索引源：把本机代码仓库目录纳入检索。
+# 目录来自设置 `code_roots`（app_settings，运行时可改，无需重启），
+# 扫描按 `CODE_EXTS` 过滤、跳过 `CODE_SKIP_DIRS`（依赖/构建产物/缓存），
+# 命中统一带 source="code"、kb_name=label（目录名），可像知识库一样按库过滤/分面。
+
+
+def _code_key(label: str, rel: str) -> str:
+    return f"code:{label}:{rel}"
+
+
+def code_roots(conn) -> list[tuple[str, Path]]:
+    """已配置的代码库根：[(label, 绝对目录)]；label 默认取目录名（重名加序号）。"""
+    try:
+        from . import search_vec
+
+        raw = search_vec.get_setting(conn, SETTING_CODE_ROOTS)
+    except Exception:  # noqa: BLE001
+        raw = ""
+    out: list[tuple[str, Path]] = []
+    seen: dict[str, int] = {}
+    for part in re.split(r"[;\r\n]+", raw or ""):
+        p = part.strip().strip('"')
+        if not p:
+            continue
+        path = Path(p)
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
+            continue
+        base = path.name or "code"
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        label = base if n == 1 else f"{base}{n}"
+        out.append((label, path))
+    return out
+
+
+def set_code_roots(conn, roots: list[str]) -> None:
+    """写入代码库根目录设置（去重、去空），并提交。"""
+    from . import search_vec
+
+    clean: list[str] = []
+    for r in roots:
+        s = str(r or "").strip()
+        if s and s not in clean:
+            clean.append(s)
+    search_vec.set_setting(conn, SETTING_CODE_ROOTS, "\n".join(clean))
+    conn.commit()
+
+
+def _scan_code(conn, label: str, root: Path, *, progress: bool = False) -> int:
+    """扫描一个代码库目录（CODE_EXTS 过滤 + CODE_SKIP_DIRS 剪枝 + 大小上限）。"""
+    if not root.exists():
+        return 0
+    known = {
+        str(r["rel"]): (int(r["size"]), float(r["mtime"]))
+        for r in conn.execute(
+            "SELECT rel, size, mtime FROM search_docs WHERE source = 'code' AND kb_name = ?",
+            (label,),
+        )
+    }
+    touched = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames if d not in CODE_SKIP_DIRS and not d.endswith(".egg-info")
+        ]
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            if p.suffix.lower() not in CODE_EXTS:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_size > MAX_INDEX_BYTES:
+                continue
+            rel = p.relative_to(root).as_posix()
+            prev = known.pop(rel, None)
+            if prev is None or prev[0] != st.st_size or abs(prev[1] - st.st_mtime) >= 1e-6:
+                try:
+                    body = file_store.read_text_capped(p, MAX_INDEX_BYTES)
+                except (OSError, ValueError):
+                    continue
+                _upsert(conn, _code_key(label, rel), body, st.st_size, st.st_mtime,
+                        source="code", kb_name=label, rel=rel, rev=0)
+                touched += 1
+                if touched % _COMMIT_EVERY == 0:
+                    conn.commit()
+            if progress:
+                _bump_progress()
+    for rel in known:   # 磁盘上已消失的
+        _drop(conn, _code_key(label, rel))
+        touched += 1
+    return touched
+
+
 # ── 知识库索引源：depot 已上传归档 ────────────────────────
 
 
@@ -843,10 +1017,12 @@ def _refresh(conn, notes_root: Path, *, force: bool = False) -> int:
         except (OSError, ValueError):
             continue
         touched += 1
-    # 2) TTL 全量比对（笔记目录；知识库归档由后台线程按事件/TTL 同步，请求路径不走网络）
+    # 2) TTL 全量比对（笔记目录 + 代码库；知识库归档由后台线程按事件/TTL 同步，请求路径不走网络）
     if due:
         for source, kb_name, src_root in _sources(conn, root):
             touched += _scan(conn, source, kb_name, src_root)
+        for label, croot in code_roots(conn):
+            touched += _scan_code(conn, label, croot)
     if touched:
         conn.commit()
     return touched
@@ -872,6 +1048,9 @@ def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
             _reindex_state["phase"] = "indexing"
         for source, kb_name, root in _sources(conn, Path(notes_root)):
             touched += _scan(conn, source, kb_name, root, progress=progress)
+            conn.commit()
+        for label, croot in code_roots(conn):
+            touched += _scan_code(conn, label, croot, progress=progress)
             conn.commit()
         for name in kb_bases(conn):
             touched += _kb_sync_one(conn, name, progress=progress)
@@ -1158,8 +1337,27 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
             item.update(_verify_kb(conn, str(item["kb_name"])))
     sources.extend(kb_rows)
 
+    for label, croot in code_roots(conn):
+        row = by_source.get(("code", label))
+        sources.append({
+            "source": "code",
+            "kb_name": label,
+            "root": str(croot),
+            "exists": croot.is_dir(),
+            "docs": int(row["docs"]) if row else 0,
+            "bytes": int(row["bytes"] or 0) if row else 0,
+            "last_indexed_at": (row["last_indexed_at"] if row else "") or "",
+            "newest_mtime": _iso(float(row["newest_mtime"])) if row and row["newest_mtime"] else "",
+        })
+
     with _lock:
         kb_pending = sorted(_kb_pending)
+
+    try:
+        from . import workspace_sync
+        ws_autosync: dict[str, Any] = workspace_sync.status()
+    except Exception as exc:  # noqa: BLE001 - 状态页容错
+        ws_autosync = {"enabled": False, "reason": f"{type(exc).__name__}: {exc}"}
 
     result: dict[str, Any] = {
         "docs": int(docs),
@@ -1176,12 +1374,15 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
         ),
         "max_index_bytes": MAX_INDEX_BYTES,
         "workspace_exts": sorted(WORKSPACE_EXTS),
+        "code_exts": sorted(CODE_EXTS),
+        "code_roots": [{"label": lb, "root": str(rp)} for lb, rp in code_roots(conn)],
         "kb_scan_ttl_s": KB_SCAN_TTL_S,
         "kb_pending": kb_pending,
         "warm": warm_state(),
         "reindex": reindex_state(),
         "history": history(conn, limit=20),
         "history_total": _history_total(conn),
+        "workspace_sync": ws_autosync,
         "deep": bool(deep),
     }
     if deep:
@@ -1473,6 +1674,305 @@ def search(
         "vec": vinfo,
         "rerank": rinfo,
     }
+
+
+def search_auto(
+    conn,
+    notes_root: Path,
+    query: str,
+    *,
+    user: str,
+    admin: bool = False,
+    limit: int = 20,
+    offset: int = 0,
+    sources: list[str] | None = None,
+    rerank: bool | None = None,
+    kb_name: str = "",
+) -> dict[str, Any]:
+    """词法优先、零命中回退 hybrid —— `mode=auto` 的入口。
+
+    长句 / 自然语言常因多子句被段间 AND 拆开而词法零命中；先 `lex`（毫秒级），
+    只在 `hits` 为空时再做一次 `hybrid`（语义兜底），避免界面显示"无命中"。
+    """
+    result = search(
+        conn, notes_root, query, user=user, admin=admin, limit=limit, offset=offset,
+        sources=sources, mode="lex", rerank=rerank, kb_name=kb_name,
+    )
+    if result.get("hits") or int(result.get("total") or 0) > 0:
+        result["mode_used"] = "lex"
+        return result
+    result = search(
+        conn, notes_root, query, user=user, admin=admin, limit=limit, offset=offset,
+        sources=sources, mode="hybrid", rerank=rerank, kb_name=kb_name,
+    )
+    result["mode_used"] = "hybrid"
+    return result
+
+
+# ── 快速选库路由（/api/search/route）───────────────────────
+#
+# 目标：复杂需求 → 相关知识库排序，供 Agent 决定读哪几个库。
+# 硬约束：必须快。请求路径只读索引表与元数据表，**不做语义探测、不访问网络**，
+# 绝不触发 `search()` 的 hybrid 兜底（无 ollama 时那里会反复探测 11434，约 6 秒）。
+
+
+def _meta_bases(conn, terms: list[str]) -> list[dict[str, Any]]:
+    """库元数据（name/title/description）与关键词块的重叠命中。"""
+    if not terms:
+        return []
+    try:
+        from . import knowledge
+
+        bases = knowledge.list_bases(conn)
+    except Exception:  # noqa: BLE001 知识库表尚未建好时不参与选库
+        return []
+    tset = set(terms)
+    out: list[dict[str, Any]] = []
+    for b in bases:
+        name = str(b.get("name") or "")
+        text = " ".join(
+            (name, str(b.get("title") or ""), str(b.get("description") or ""))
+        )
+        hits = len(tset & set(_tokens(text)))
+        if hits:
+            out.append({"kb_name": name, "meta_hits": hits})
+    return out
+
+
+def _kb_aggregate(
+    conn,
+    notes_root: Path,
+    terms: list[str],
+    *,
+    user: str,
+    admin: bool,
+    sources: list[str] | None,
+    refresh_index: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """词法按库聚合：一次 GROUP BY kb_name 拿到各库命中量与最优 bm25。
+
+    `refresh_index=False`（选库快路径）跳过 TTL 全量比对——选库容忍几秒陈旧，
+    换掉每次可能 stat 整个笔记目录的开销。
+    """
+    if not terms:
+        return {}
+    match = route_match_expr(terms)
+    if not match:
+        return {}
+    if refresh_index:
+        refresh(conn, notes_root)
+    params: dict[str, Any] = {"q": match, "user": user, "admin": 1 if admin else 0}
+    src_clause = _src_clause(sources, params, prefix="rsrc")
+    rows = conn.execute(
+        "SELECT search_docs.kb_name AS kb_name, COUNT(*) AS doc_hits,"
+        " MIN(search_fts.rank) AS best_rank"
+        " FROM search_fts JOIN search_docs ON search_docs.rowid = search_fts.rowid"
+        f" WHERE search_fts MATCH :q {_PERM_SQL}{src_clause}"
+        " GROUP BY search_docs.kb_name",
+        params,
+    ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        name = str(r["kb_name"] or "")
+        if not name:
+            continue
+        out[name] = {
+            "doc_hits": int(r["doc_hits"] or 0),
+            "best_bm25": round(float(r["best_rank"] or 0.0), 4),
+        }
+    return out
+
+
+def _kb_semantic(conn, query: str) -> dict[str, float]:
+    """depth=2 语义加分：按库取库内文档最高语义相似度（不可用 → 空，绝不阻塞）。
+
+    先按模型阈值过滤，避免弱相似（余弦 0.4~0.5）把无关库抬进结果。
+    """
+    try:
+        from . import search_vec
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        scores = search_vec.kb_semantic_scores(conn, query)
+        if not scores:
+            return {}
+        floor = float(search_vec.vec_min(search_vec.model(conn)))
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: v for k, v in scores.items() if v >= floor}
+
+
+_route_cache: dict[tuple, tuple[float, dict[str, Any]]] = {}
+
+
+def _route_cache_get(key: tuple) -> dict[str, Any] | None:
+    item = _route_cache.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if time.monotonic() - ts > _ROUTE_CACHE_TTL:
+        _route_cache.pop(key, None)
+        return None
+    return val
+
+
+def _route_cache_put(key: tuple, val: dict[str, Any]) -> None:
+    if key not in _route_cache and len(_route_cache) >= _ROUTE_CACHE_MAX:
+        oldest = min(_route_cache, key=lambda k: _route_cache[k][0])
+        _route_cache.pop(oldest, None)
+    _route_cache[key] = (time.monotonic(), dict(val))
+
+
+def route(
+    conn,
+    notes_root: Path,
+    query: str,
+    *,
+    user: str,
+    admin: bool = False,
+    depth: int = 1,
+    limit: int = 10,
+    sources: list[str] | None = None,
+    budget_ms: int = 0,
+) -> dict[str, Any]:
+    """快速选库：复杂需求 → 相关知识库排序（毫秒级，见 routers/search.py `/route`）。
+
+    depth 分档：
+      0 —— 仅库元数据匹配（name/title/description）
+      1 —— 元数据 + FTS5 词法按库聚合（默认，量级 ~毫秒）
+      2 —— 语义档：需求嵌一次，与**各库摘要向量**（元数据 + 文档质心）比对作为加分；
+            语义不可用 / 无命中 → **自动降级为 1** 并在 reason 说明（0.3s TCP 探测兜底，不阻塞）
+      3 —— 不处理：需求分解 / 多查询由调用方自行完成（返回空 kbs + 说明）
+
+    返回 {depth_req, depth_used, degraded, reason, reason_code, took_ms, cached, terms, kbs}；
+    kbs 按 score 降序（score = 0.5*log1p(doc_hits) + 2.5*meta_hits + 1.5*vec + 1.5*tanh(-bm25/20)）。
+    同一 (q, req, budget, limit, sources, user) 结果缓存 `_ROUTE_CACHE_TTL` 秒（`cached=true`）。
+    `budget_ms>0 且 <100` 时 `depth>=2` 自动退回 `1`（`reason_code=budget_downgrade`）。
+    """
+    started = time.perf_counter()
+    req = int(depth) if depth is not None else 1
+    req = max(0, min(req, 3))
+    req_orig = req
+    budget = max(0, int(budget_ms or 0))
+    limit = max(1, min(int(limit or 10), 50))
+    src_key = tuple(sources or ())
+
+    cache_key = (query, req_orig, budget, limit, src_key, user, 1 if admin else 0)
+    hit = _route_cache_get(cache_key)
+    if hit is not None:
+        return {**hit, "cached": True,
+                "took_ms": round((time.perf_counter() - started) * 1000, 2)}
+
+    degraded = False
+    reason = ""
+    reason_code = "ok"
+    if req >= 3:
+        used = 3
+        degraded = True
+        reason = "depth>=3 需要需求分解/多查询，请调用方自行处理"
+        reason_code = "delegate"
+    elif req == 2 and budget and budget < 100:
+        used = 1
+        degraded = True
+        reason = "budget_ms<100，跳过语义档，按 depth=1 返回"
+        reason_code = "budget_downgrade"
+    else:
+        used = req
+
+    if used == 3:
+        result: dict[str, Any] = {
+            "query": query, "depth_req": req_orig, "depth_used": 3,
+            "degraded": True, "reason": reason, "reason_code": reason_code,
+            "took_ms": round((time.perf_counter() - started) * 1000, 2),
+            "cached": False, "terms": [], "kbs": [],
+        }
+        _route_cache_put(cache_key, result)
+        return result
+
+    terms = route_terms(query)
+    entries: dict[str, dict[str, Any]] = {}
+    include_kb = (not sources) or ("kb" in sources)
+
+    if used >= 1:
+        agg = _kb_aggregate(
+            conn, notes_root, terms, user=user, admin=admin, sources=sources,
+            refresh_index=False,
+        )
+        meta = (
+            {m["kb_name"]: m for m in _meta_bases(conn, terms)} if include_kb else {}
+        )
+        for name, info in agg.items():
+            entries[name] = {
+                "kb_name": name,
+                "doc_hits": info["doc_hits"],
+                "best_bm25": info["best_bm25"],
+                "meta_hits": int(meta.get(name, {}).get("meta_hits", 0)),
+                "vec": 0.0,
+            }
+        # 元数据命中但索引里没有的库也保留（归档未连通时索引可能为空）
+        for name, m in meta.items():
+            if name not in entries:
+                entries[name] = {
+                    "kb_name": name,
+                    "doc_hits": 0,
+                    "best_bm25": 0.0,
+                    "meta_hits": int(m["meta_hits"]),
+                    "vec": 0.0,
+                }
+    elif include_kb:   # depth 0：只靠元数据
+        for m in _meta_bases(conn, terms):
+            entries[m["kb_name"]] = {
+                "kb_name": m["kb_name"],
+                "doc_hits": 0,
+                "best_bm25": 0.0,
+                "meta_hits": int(m["meta_hits"]),
+                "vec": 0.0,
+            }
+
+    # depth=2：语义加分（需求嵌一次，与各库摘要向量比对）
+    if used == 2:
+        vs = _kb_semantic(conn, query)
+        if vs:
+            for name, v in vs.items():
+                e = entries.get(name)
+                if e is None:
+                    e = entries[name] = {
+                        "kb_name": name,
+                        "doc_hits": 0,
+                        "best_bm25": 0.0,
+                        "meta_hits": 0,
+                        "vec": 0.0,
+                    }
+                e["vec"] = round(float(v), 4)
+        else:
+            used = 1
+            degraded = True
+            reason = "语义不可用或无语义命中，已降级为 depth=1"
+            reason_code = "semantic_degraded"
+
+    for e in entries.values():
+        e["score"] = round(
+            _ROUTE_W_DOCS * math.log1p(e["doc_hits"])
+            + _ROUTE_W_META * e["meta_hits"]
+            + _ROUTE_W_VEC * e["vec"]
+            + _ROUTE_W_BM25 * math.tanh(-float(e["best_bm25"]) / _ROUTE_BM25_SCALE),
+            4,
+        )
+    ranked = sorted(entries.values(), key=lambda e: (-e["score"], e["kb_name"]))[:limit]
+    result = {
+        "query": query,
+        "depth_req": req_orig,
+        "depth_used": used,
+        "degraded": degraded,
+        "reason": reason,
+        "reason_code": reason_code,
+        "took_ms": round((time.perf_counter() - started) * 1000, 2),
+        "cached": False,
+        "terms": terms,
+        "kbs": ranked,
+    }
+    _route_cache_put(cache_key, result)
+    return result
 
 
 def _perm_params(user: str, admin: bool) -> dict[str, Any]:
