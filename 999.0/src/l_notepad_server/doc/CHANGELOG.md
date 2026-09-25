@@ -11,13 +11,17 @@
 - 用途不止给人看：`explain.summary` 可直接作为 Agent「为什么召回它」的依据
 
 ### 「要搜索哪些包」（2026-09-25 晚）
-- 🔤 搜索页新增 **rez 源码包勾选**：`GET /api/search/code_packages` 列出货架（`L_NOTEPAD_PKG_ROOT`，
-  默认 `<trayapp>/rez-package-source`）下带 `package.py` 的包（本机 54 个），勾选后只在这些包里搜代码；
+- 🔤 搜索页新增 **本机库勾选**：`GET /api/search/code_packages` 列出**全部本机库**——`code` 代码库根
+  （`code_roots`，如 `l_notepad_client`）/ `pkg` rez 源码包（货架 `L_NOTEPAD_PKG_ROOT` 下带 `package.py`
+  的一级目录，本机 53 个）/ `kbws` 知识库工作区；勾选后只在这些库里搜代码，
   `GET /api/search?packages=a,b` 只作用于 `source=code`（笔记 / 知识库不受影响）；**默认不勾选 = 不限**
+  - 修：早期只列 `pkg`，`l_notepad_client`（同时是货架里的包 + 已配的代码库根，按路径去重后只留 `code` 一项）
+    不在列表里 → 勾了别的包时它的命中被过滤掉却勾不回来；现在列表 = 全部本机库
 - 🗂 包是**手动建索引**的第三类本机库（`kind=pkg`）：`POST /api/search/index_lib {"label":"l_agent_chat"}`
   （实测 133 文件 / 0.7s）；不参与 TTL 自动刷新，全量重建也只重建「建过索引的」包
   （货架全量 3 万+ 文件 / ≈1.9GB，一次铺开会失控）
-- 💾 勾选状态存浏览器 `localStorage['ln_search_packages']`；从顶栏进搜索页时自动补进 URL
+- 💾 勾选状态存浏览器 `localStorage['ln_search_packages']`；从顶栏进搜索页时自动补进 URL；
+  列表上方有「过滤包名…」输入框（只隐藏不匹配项，不影响勾选状态）
 
 ### 长句召回与排序修正（2026-09-25 晚，口语整句实测驱动）
 - 🧩 **长句不再段间 AND**（`build_match_expr`）：段数 > `_MAX_AND_GROUPS`(4) 时改走「全部单元 OR + 覆盖率排序」。
