@@ -1,5 +1,68 @@
 # L Notepad 更新日志
 
+## v3.4.0 (2026-09-25)
+
+### 「判断依据」：每条命中为什么排在这里（2026-09-25 晚）
+- 🧾 每条命中新增 `explain` 字段（`_explain` / `_annotate_ranks`）：分项表（权重×取值=得分）、
+  逐词块明细（**IDF 权重 + 出现次数**）、被判泛词（权重 0，不参与打分）、未命中词块、
+  名次 `rank/of`、排序主序 `order_by`、与**下一条**的分差与主因（`vs_next`）、一句话结论 `summary`
+- 🔘 结果卡片新增「判断依据」按钮 → 弹出对话框（`static/app.js` 的 `LN.renderSearchHits` +
+  `.ln-why` 样式在 `app.css`）：顶栏弹窗、搜索页、「试搜」三处共用，纯前端渲染，无额外请求
+- 用途不止给人看：`explain.summary` 可直接作为 Agent「为什么召回它」的依据
+
+### 「要搜索哪些包」（2026-09-25 晚）
+- 🔤 搜索页新增 **rez 源码包勾选**：`GET /api/search/code_packages` 列出货架（`L_NOTEPAD_PKG_ROOT`，
+  默认 `<trayapp>/rez-package-source`）下带 `package.py` 的包（本机 54 个），勾选后只在这些包里搜代码；
+  `GET /api/search?packages=a,b` 只作用于 `source=code`（笔记 / 知识库不受影响）；**默认不勾选 = 不限**
+- 🗂 包是**手动建索引**的第三类本机库（`kind=pkg`）：`POST /api/search/index_lib {"label":"l_agent_chat"}`
+  （实测 133 文件 / 0.7s）；不参与 TTL 自动刷新，全量重建也只重建「建过索引的」包
+  （货架全量 3 万+ 文件 / ≈1.9GB，一次铺开会失控）
+- 💾 勾选状态存浏览器 `localStorage['ln_search_packages']`；从顶栏进搜索页时自动补进 URL
+
+### 长句召回与排序修正（2026-09-25 晚，口语整句实测驱动）
+- 🧩 **长句不再段间 AND**（`build_match_expr`）：段数 > `_MAX_AND_GROUPS`(4) 时改走「全部单元 OR + 覆盖率排序」。
+  口语原句 `ctrl+中键呼出…整个电脑都卡很久` 被切成 6–8 段，原来段间 AND 只剩 **2 条**命中（目标文件不在候选里，
+  重排也无从下手）；改后同一句 **87 条**候选，目标文件可被重排顶到第 1
+- 🔀 **`mode=auto` 长句自动走混合**（`search_auto`）：命中 < `_AUTO_MIN_HITS`(3) **或** 查询本身是长句时改用 hybrid
+  （语义 + 重排）。此前 `auto` 只在零命中才回退，长句会停在「lex 的 2 条结果」上
+- 实测同一句 `mode=auto`：`mode_used=hybrid`、`total=87`、约 1.5s，**第 1 名 = `folder_favorites_hotkey.py`**（重排 +0.74）
+
+### 新增功能
+- 🗃 **手动「创建索引」（本机库）**：搜索页新增「索引管理」面板，按库点「创建索引」即扫该库目录（**含 `.py` 等代码文件**），只写本机索引、**不触发 depot 上传**
+  - `GET /api/search/index_libs`：可建索引的本机库（`kind=code` 代码库根 / `kind=kbws` 知识库工作区）+ 已索引文档数 + 最近扫描状态
+  - `POST /api/search/index_lib`（管理员，`{"label": "...", "embed": true}`）：只扫该库 → 返回 `files/touched/duration_ms/capped`，随后台嵌入向量
+  - 知识库工作区走**本机索引**而非归档：`workspace_sync` 上传白名单仍是文档类型（`.py` 不会被动上传），工作区文件也不会被归档同步删掉；代码库根仍随 `SCAN_TTL_S` 自动刷新，工作区只在手动点按时重建（手动全量重建也会带上它们）
+- 🧠 **代码库参与向量语义**：`source=code` 纳入嵌入流程（读本机文件，键 `code:<label>:<rel>`），口语症状（"卡很久/卡顿"）现在能语义召回代码 —— 实测原句命中目标文件 `vec=0.63`
+  - 单篇嵌入失败改为**跳过并计数**（`_EMBED_RETRY_MAX=3` 后放弃），一篇坏文档不再卡住整轮；`stats.vec.by_source` / `dropped` 可见
+  - 内存向量缓存分额度：代码块上限 `L_NOTEPAD_VEC_CODE_CHUNKS`（默认 8000），避免代码把笔记/知识库挤出缓存
+- 🔤 **关键词抽取与泛词抑制**：
+  - 路由关键词保留**关键单字**（`卡/慢/死`，FTS 前缀匹配）、同义扩展（`卡 ↔ 卡顿/卡死/阻塞`，`_SYNONYMS`）；bigram 只在**整块都是低信息字**时才丢弃（原来含单个低信息字就丢，「卡很」会被误杀）
+  - **IDF 泛词抑制**：`term_idf()` 用 FTS5 词表（`fts5vocab`）算词块文档频率，占比 ≥ 30% 的 repo 泛词（`notepad/client/窗口/程序`）不参与覆盖率/词频/近邻打分，路由层直接剔除（`terms_generic_dropped`）
+- 📄 **代码命中体验**：新增只读查看页 `GET /web/code?root=&file=&hl=`（行号 + 命中词高亮，超 5000 行截断）；结果卡片代码库命中加 🧩 与库名徽标；`open_url` 统一指向该页
+- 🛡 **代码库体量治理**：`L_NOTEPAD_CODE_MAX_FILES`（默认 20000）/ `L_NOTEPAD_CODE_MAX_BYTES`（默认 512MB）超限即停止扫描并标记 `capped`（截断时**不会**误删索引行）；`CODE_SKIP_DIRS` 增加 `.vs/obj/.ruff_cache/.pytype/__pypackages__/.ipynb_checkpoints/htmlcov`
+- 🧭 **`route` 支持本机库**：`sources` 默认 `kb,code`，depth0 用库标签做元数据命中，结果带 `terms_generic_dropped`
+
+### 重排（rerank）落地（2026-09-25）
+- 本机部署 llama.cpp `llama-server --reranking`（`D:\Tools\llama.cpp\start_rerank.bat`，端口 11435）+
+  `bge-reranker-v2-m3-Q8_0.gguf`；`package.py` 在非 `Lugwit_deploy` 环境注入
+  `L_NOTEPAD_RERANK_URL` / `L_NOTEPAD_RERANK_TOP_N=8` / `L_NOTEPAD_RERANK_MAX_CHARS=300` / `L_NOTEPAD_RERANK_TIMEOUT_S=8`
+- 新增 `L_NOTEPAD_RERANK_MAX_CHARS`（默认 400）：候选只送「查询词附近」的一窗。
+  cross-encoder 成本 ≈ 正比 token 数，块按 900 字符切分 ≈ 350 token，CPU 上每个候选 0.5s，不截断没法用
+- 实测（16C/32T CPU，bge-reranker-v2-m3 Q8）：5 候选 `rerank≈0.6s`、整轮 `hybrid`≈0.85s；
+  口语整句「ctrl+中键呼出…整个电脑卡很久」的目标文件 `folder_favorites_hotkey.py` 由第 3 名升到**第 1 名**
+- `-ub` 必须调大（启动脚本用 2048）：默认 512 装不下一个 400 字符候选 → 退化成一次打一个候选
+
+### 接口
+- 新增 `GET /api/search/index_libs`、`POST /api/search/index_lib`
+- `GET /api/search/route`：`sources` 默认由 `kb` 改为 `kb,code`；返回新增 `terms_generic_dropped`
+- `GET /api/search/code/file`：`root` 支持知识库工作区标签（不再只限 `code_roots`）
+- `GET /api/search/stats` 新增 `code_libs` / `code_max_files` / `code_max_bytes`，`sources[]` 的 code 行带 `kind` / `editable` / `scan`
+- `GET /web/search` 新增「索引管理」面板；新增页面 `GET /web/code`
+
+### 行为变化
+- 泛词（覆盖率 ≥ 30% 的词块）不再参与相关性打分 → 命中项 `coverage` / `score` 会与旧版不同（更贴近"以罕见词定排名"）
+- `route` 默认多返回代码库/工作区候选；Agent 只要知识库请显式 `sources=kb`
+
 ## v3.3.0 (2026-09-24)
 
 ### 新增功能
@@ -36,7 +99,6 @@ llama-server --reranking -m bge-reranker-v2-m3.gguf --port 11435
 ```
 
 然后在服务端设 `L_NOTEPAD_RERANK_URL=http://127.0.0.1:11435`（或只对单次请求带 `&rerank=1` 验证）。
-
 ### 注意
 - 重排是**额外一次本地推理**：CPU 上 40 个候选块可能到几百毫秒，状态页「最近耗时」可作为调整 `L_NOTEPAD_RERANK_TOP_N` 的依据
 - 首次调用即探测；失败结果缓存 60s（避免每次检索都等超时），改配置或页面切换开关会清掉探测与冷却状态、立即重试

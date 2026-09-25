@@ -416,8 +416,9 @@
           var body = (window.LN && LN.renderSearchHits)
             ? LN.renderSearchHits(hits)
             : (hits.map(function (h) {
+                var icon = h.source === "kb" ? "📚 " : (h.source === "code" ? "🧩 " : "📝 ");
                 return '<div class="hit"><div class="hit-head"><a href="' + h.open_url + '">' +
-                  (h.source === "kb" ? "📚 " : "📝 ") + h.rel + "</a></div></div>";
+                  icon + (h.source === "code" ? (h.kb_name || "") + " / " : "") + h.rel + "</a></div></div>";
               }).join("") || '<div class="muted">无命中</div>');
           pop.innerHTML = head + body;
           fitPop();

@@ -128,11 +128,20 @@ def query_text(query: str, model_name: str = "") -> str:
     return query or ""
 MAX_CHUNKS_PER_DOC = 200  # 超长文档的块数上限
 CACHE_MAX_CHUNKS = 20000  # 内存缓存的块数上限（超出则只缓存最近使用的文档）
+# 本机库（source='code'）分到的缓存额度：代码块数量容易把笔记/知识库挤出缓存，
+# 所以给代码一个上限（0 = 不分额度，按全局上限先到先得）。
+CODE_CACHE_CHUNKS = int(os.environ.get("L_NOTEPAD_VEC_CODE_CHUNKS", "8000") or 0)
+# 单篇嵌入连续失败多少次后放弃（否则一篇坏文档每轮同步都重试一次）
+_EMBED_RETRY_MAX = 3
 
 _lock = threading.Lock()
 _cache: dict[str, list[tuple[int, tuple[float, ...]]]] = {}  # doc_key -> [(chunk_no, vec)]
 _cache_dirty = True
 _model_cache: str = ""
+# 单篇嵌入失败计数 / 最近原因 / 已放弃的文档（内存态，重启即清）
+_embed_failures: dict[str, int] = {}
+_embed_last_error: dict[str, str] = {}
+_embed_dropped: dict[str, str] = {}
 
 # 后台嵌入任务状态（状态页展示）
 embed_state: dict[str, Any] = {
@@ -555,7 +564,19 @@ def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
 
 
 def _doc_key(source: str, kb_name: str, rel: str) -> str:
-    return rel if source == "note" else search_index._kb_key(kb_name, rel)
+    if source == "note":
+        return rel
+    if source == "code":
+        return search_index._code_key(kb_name, rel)
+    return search_index._kb_key(kb_name, rel)
+
+
+def _code_roots_map(conn) -> dict[str, Path]:
+    """本机库标签 → 目录（代码库根 + 知识库工作区），用于读代码正文。"""
+    try:
+        return dict(search_index.local_lib_map(conn))
+    except Exception:  # noqa: BLE001 - 取不到就当没有本机库可嵌入
+        return {}
 
 
 def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str, Any]]:
@@ -563,7 +584,8 @@ def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str,
 
     以 search_docs（词法索引）为准，比对 vec_docs 的 size/mtime/rev 找出新增/变更；
     同时清理 vec_docs 中已不在 search_docs 的条目。个人笔记读本机文件（path），
-    知识库文档读 depot 归档（path 为 None，内容按 rel+rev 取）。
+    知识库文档读 depot 归档（path 为 None，内容按 rel+rev 取），本机库（代码库根 /
+    知识库工作区）读本机文件（path），标签到目录的映射见 `search_index.local_libs`。
     """
     docs_rows = conn.execute(
         "SELECT note_path AS key, source, kb_name, rel, size, mtime, rev FROM search_docs"
@@ -573,6 +595,7 @@ def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str,
         for r in conn.execute("SELECT doc_key, size, mtime, rev, model FROM vec_docs")
     }
     mdl = model(conn)
+    code_map = _code_roots_map(conn)
     todo: list[dict[str, Any]] = []
     alive: set[str] = set()
     for r in docs_rows:
@@ -587,6 +610,15 @@ def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str,
                 path = search_index.file_store.resolve_note_path(Path(notes_root), rel)
             except ValueError:
                 continue
+        elif source == "code":
+            root = code_map.get(kb_name)
+            if root is None:
+                continue        # 库已取消配置/工作区已清空 → 词法索引清理后自然消失
+            try:
+                path = (root / rel).resolve()
+                path.relative_to(root.resolve())
+            except (OSError, ValueError):
+                continue        # 越界/异常路径：不嵌入
         todo.append({
             "key": key, "source": source, "kb_name": kb_name, "rel": rel,
             "size": int(r["size"]), "mtime": float(r["mtime"]), "rev": int(r["rev"]),
@@ -601,8 +633,8 @@ def _pending_docs(conn, notes_root: Path, force: bool = False) -> list[dict[str,
 
 
 def _doc_text(conn, doc: dict[str, Any]) -> str:
-    """取待嵌入正文：个人笔记读本机文件，知识库文档读 depot 归档（不依赖本机工作区）。"""
-    if doc["source"] == "note":
+    """取待嵌入正文：个人笔记与本机库读本机文件，知识库文档读 depot 归档。"""
+    if doc["source"] in ("note", "code"):
         return search_index.file_store.read_text_capped(doc["path"], search_index.MAX_INDEX_BYTES)
     from . import depot_map
 
@@ -657,7 +689,11 @@ def embed_doc(conn, doc: dict[str, Any]) -> int:
 
 
 def refresh(conn, notes_root: Path, *, force: bool = False) -> int:
-    """增量嵌入（同步）。返回本次嵌入的文档数。"""
+    """增量嵌入（同步）。返回本次嵌入的文档数。
+
+    单篇失败只记错误并继续——一篇取不到内容（归档缺 blob / 编码异常）不该把后面
+    所有文档的嵌入一起卡住。
+    """
     if not enabled() or not model():
         return 0
     todo = _pending_docs(conn, notes_root, force=force)
@@ -665,14 +701,44 @@ def refresh(conn, notes_root: Path, *, force: bool = False) -> int:
         return 0
     done = 0
     for doc in todo:
+        if _embed_skip(str(doc["key"]), force=force):
+            continue
         try:
             embed_doc(conn, doc)
+            _embed_ok(str(doc["key"]))
             done += 1
         except Exception as exc:  # noqa: BLE001 - 单篇失败不影响其它
-            with _lock:
-                embed_state["error"] = f"{type(exc).__name__}: {exc}"
-            break
+            _embed_failed(str(doc["key"]), exc)
     return done
+
+
+def _embed_skip(key: str, *, force: bool = False) -> bool:
+    """该文档是否已超出失败重试额度（force 时重置）。"""
+    with _lock:
+        if force:
+            _embed_failures.pop(key, None)
+            return False
+        return int(_embed_failures.get(key, 0)) >= _EMBED_RETRY_MAX
+
+
+def _embed_ok(key: str) -> None:
+    with _lock:
+        _embed_failures.pop(key, None)
+        _embed_last_error.pop(key, None)
+
+
+def _embed_failed(key: str, exc: Exception) -> None:
+    """累计单篇失败次数并记录原因；达到 `_EMBED_RETRY_MAX` 后不再反复重试。"""
+    msg = f"{type(exc).__name__}: {exc}"
+    with _lock:
+        n = int(_embed_failures.get(key, 0)) + 1
+        _embed_failures[key] = n
+        _embed_last_error[key] = msg
+        embed_state["error"] = msg
+        if n >= _EMBED_RETRY_MAX:
+            _embed_dropped[key] = msg
+            while len(_embed_dropped) > 50:
+                _embed_dropped.pop(next(iter(_embed_dropped)))
 
 
 def start_embed_async(db_path: Path, notes_root: Path, *, force: bool = False) -> bool:
@@ -701,7 +767,14 @@ def _embed_worker(db_path: Path, notes_root: Path, force: bool) -> None:
             embed_state["phase"] = "embedding"
             embed_state["total"] = len(todo)
         for doc in todo:
-            embed_doc(conn, doc)
+            if _embed_skip(str(doc["key"]), force=force):
+                continue
+            try:
+                embed_doc(conn, doc)
+            except Exception as exc:  # noqa: BLE001 - 单篇失败不中断整轮
+                _embed_failed(str(doc["key"]), exc)
+                continue
+            _embed_ok(str(doc["key"]))
             with _lock:
                 embed_state["docs"] = int(embed_state.get("docs", 0)) + 1
     except Exception as exc:  # noqa: BLE001
@@ -715,6 +788,7 @@ def _embed_worker(db_path: Path, notes_root: Path, force: bool) -> None:
         with _lock:
             embed_state["running"] = False
             embed_state["finished_at"] = _now()
+            embed_state["dropped"] = sorted(_embed_dropped)
 
 
 # ── 检索 ────────────────────────────────────────────────
@@ -735,18 +809,31 @@ def reset_cache() -> None:
 
 
 def _load_cache(conn) -> dict[str, list[tuple[int, tuple[float, ...]]]]:
-    """把块向量读进内存（首次或索引变更后重建）。"""
+    """把块向量读进内存（首次或索引变更后重建）。
+
+    分两段装：先非代码（笔记 / 知识库），再按 `CODE_CACHE_CHUNKS` 额度装本机库。
+    否则本机库动辄数万块，会把笔记挤出去（原先按 id 倒序取，后写的先装）。
+    """
     global _cache, _cache_dirty
     with _lock:
         if not _cache_dirty and _cache:
             return _cache
     cache: dict[str, list[tuple[int, tuple[float, ...]]]] = {}
-    total = 0
+    code_budget = min(int(CODE_CACHE_CHUNKS or 0), CACHE_MAX_CHUNKS)
+    rest = max(CACHE_MAX_CHUNKS - code_budget, 0)
+    sql = (
+        "SELECT c.doc_key AS doc_key, c.chunk_no AS chunk_no, c.vec AS vec"
+        " FROM vec_chunks c JOIN vec_docs d ON d.doc_key = c.doc_key"
+    )
     for r in conn.execute(
-        "SELECT doc_key, chunk_no, vec FROM vec_chunks ORDER BY id DESC LIMIT ?", (CACHE_MAX_CHUNKS,)
+        f"{sql} WHERE d.source <> 'code' ORDER BY c.id DESC LIMIT ?", (rest,)
     ):
         cache.setdefault(r["doc_key"], []).append((int(r["chunk_no"]), _unpack(r["vec"])))
-        total += 1
+    if code_budget:
+        for r in conn.execute(
+            f"{sql} WHERE d.source = 'code' ORDER BY c.id DESC LIMIT ?", (code_budget,)
+        ):
+            cache.setdefault(r["doc_key"], []).append((int(r["chunk_no"]), _unpack(r["vec"])))
     with _lock:
         _cache = cache
         _cache_dirty = False
@@ -977,6 +1064,9 @@ RERANK_URL = os.environ.get("L_NOTEPAD_RERANK_URL", "").strip().rstrip("/")
 RERANK_MODEL_ENV = os.environ.get("L_NOTEPAD_RERANK_MODEL", "").strip()
 RERANK_TIMEOUT_S = _env_float("L_NOTEPAD_RERANK_TIMEOUT_S", 3.0)
 RERANK_TOP_N = _env_int("L_NOTEPAD_RERANK_TOP_N", 40)
+# 单个候选送进 cross-encoder 的字符上限（成本 ≈ 正比 token 数：900 字符块 ≈ 350 token，
+# CPU 上每个候选约 0.3s，40 个候选就是十几秒——窗口化后便宜得多）
+RERANK_MAX_CHARS = _env_int("L_NOTEPAD_RERANK_MAX_CHARS", 400)
 RERANK_FAIL_LIMIT = 3       # 连续失败多少次后进入冷却
 RERANK_COOLDOWN_S = 60.0    # 冷却时长（冷却期内不发起请求）
 RERANK_PROBE_TTL_S = 60.0   # 可用性探测结果的缓存时长
@@ -1080,6 +1170,31 @@ def _rerank_call(query: str, documents: list[str], model_name: str) -> list[tupl
     raise last or RuntimeError("rerank 请求失败")
 
 
+def _trim_for_rerank(text: str, query: str, limit: int = RERANK_MAX_CHARS) -> str:
+    """把候选块截到 `limit` 字符，窗口以查询词首次出现处为中心。
+
+    cross-encoder 的成本与 token 数近似线性，而块按 900 字符切分 → 每个候选约 350 token。
+    CPU 上 40 个候选要十几秒，所以只送「最可能有答案」的那一窗；窗口落空则退回块首。
+    """
+    body = str(text or "")
+    if limit <= 0 or len(body) <= limit:
+        return body
+    low = body.lower()
+    pos = -1
+    for term in search_index._tokens(query or ""):
+        if not term:
+            continue
+        at = low.find(str(term).lower())
+        if at >= 0 and (pos < 0 or at < pos):
+            pos = at
+            if pos < limit // 4:
+                break
+    if pos < 0:
+        return body[:limit]
+    start = max(0, pos - limit // 4)
+    return body[start : start + limit]
+
+
 def rerank_docs(
     conn, query: str, documents: list[str]
 ) -> tuple[Optional[list[tuple[int, float]]], dict[str, Any]]:
@@ -1115,7 +1230,7 @@ def rerank_docs(
 
     started = time.perf_counter()
     try:
-        out = _rerank_call(query, documents, model_name)
+        out = _rerank_call(query, [_trim_for_rerank(d, query) for d in documents], model_name)
     except Exception as exc:  # noqa: BLE001 - 降级：本轮退回融合排序
         took = round((time.perf_counter() - started) * 1000, 2)
         with _lock:
@@ -1197,10 +1312,18 @@ def stats(conn) -> dict[str, Any]:
     chunks = conn.execute("SELECT COUNT(*) AS c FROM vec_chunks").fetchone()["c"]
     dim = conn.execute("SELECT MAX(dim) AS d FROM vec_chunks").fetchone()["d"]
     last = conn.execute("SELECT MAX(embedded_at) AS t FROM vec_docs").fetchone()["t"]
+    by_source = {
+        str(r["source"]): {"docs": int(r["docs"]), "chunks": int(r["chunks"] or 0)}
+        for r in conn.execute(
+            "SELECT d.source AS source, COUNT(*) AS docs, SUM(d.chunks) AS chunks"
+            " FROM vec_docs d GROUP BY d.source"
+        )
+    }
     with _lock:
         cached = len(_cache)
         state = dict(embed_state)
         dl = dict(download_state)
+        dropped = sorted(_embed_dropped)
     cur_model = model(conn)
     return {
         "available": available(conn),
@@ -1209,11 +1332,15 @@ def stats(conn) -> dict[str, Any]:
         "docs": int(docs),
         "chunks": int(chunks),
         "dim": int(dim or 0),
+        "by_source": by_source,
         "last_embedded_at": str(last or ""),
         "chunk_size": chunk_size_for(cur_model),
         "query_instruction": needs_query_instruction(cur_model),
         "batch": BATCH,
         "cached_docs": cached,
+        "cache_max_chunks": CACHE_MAX_CHUNKS,
+        "code_cache_chunks": CODE_CACHE_CHUNKS,
+        "dropped": dropped,
         "embed": state,
         "download": dl,
         "catalog": catalog(conn),

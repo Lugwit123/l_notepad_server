@@ -52,6 +52,10 @@ _KB_FETCH_MAX_DOCS = 100
 _KB_FETCH_BYTES = 32 * 1024 * 1024
 # 单次检索返回条数上限
 MAX_LIMIT = 500
+# 段间 AND 的组数上限：超过即改走「全部 OR + 覆盖率排序」（见 build_match_expr）
+_MAX_AND_GROUPS = 4
+# `mode=auto` 认为词法「够用」的最少命中数：少于它就跑一遍 hybrid（语义 + 重排）
+_AUTO_MIN_HITS = 3
 # 重排取回的候选倍数（先按 bm25 取 offset+limit 的 K 倍，再按相关性重排）
 _CANDIDATE_FACTOR = 6
 
@@ -83,10 +87,17 @@ CODE_EXTS = WORKSPACE_EXTS | {
 CODE_SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
     ".idea", ".vscode", "dist", "build", "target", ".mypy_cache", ".pytest_cache",
-    ".tox", ".next", ".cache", ".gradle", "site-packages",
+    ".tox", ".next", ".cache", ".gradle", "site-packages", ".vs", "obj",
+    ".ipynb_checkpoints", ".ruff_cache", ".pytype", "__pypackages__", "htmlcov",
 }
 # 代码库根目录（换行/分号分隔的绝对路径）持久化在 app_settings
 SETTING_CODE_ROOTS = "code_roots"
+
+# 代码库体量治理：单个库的文件数与累计字节上限（0 = 不限）。
+# 指到整棵树（几十万 .py）时必须有刹车：超限即停止扫描并在状态里标记 capped，
+# 让「手动创建索引」不会变成一次把服务拖死的操作。
+CODE_MAX_FILES = int(os.environ.get("L_NOTEPAD_CODE_MAX_FILES", "20000") or 0)
+CODE_MAX_BYTES = int(os.environ.get("L_NOTEPAD_CODE_MAX_BYTES", str(512 * 1024 * 1024)) or 0)
 
 # 选库路由（route）：关键词块上限 + 打分权重（见 route()）
 _ROUTE_MAX_TERMS = 40    # 关键词块上限，防超长需求拖慢
@@ -103,6 +114,28 @@ _ROUTE_STOP_CHARS = set(
     "的了是在和与或这那之其也就都还而并且把被为对从到很会能可要需请吧吗呢啊呀哦嗯"
     "我你他她它们个来去做用以于上下中里外前后时"
 )
+
+# 口语症状 → 文档/代码里的用词（只作用于选库路由的**召回层**，覆盖打分不受影响）。
+# 「知道词才搜得到」的补丁：用户写「卡很久」，代码里写「卡顿/阻塞」，靠这张表搭桥。
+_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "卡": ("卡顿", "卡死", "阻塞", "无响应", "hang"),
+    "卡顿": ("卡", "卡死", "阻塞", "无响应"),
+    "卡死": ("卡", "卡顿", "阻塞", "无响应"),
+    "慢": ("缓慢", "性能", "耗时", "超时"),
+    "死": ("卡死", "崩溃", "闪退"),
+    "崩": ("崩溃", "闪退", "报错"),
+    "崩溃": ("闪退", "报错", "异常退出"),
+    "闪退": ("崩溃", "异常退出"),
+    "卡很": ("卡", "卡顿"),
+}
+
+# 泛词抑制（IDF）：词块出现在超过该比例的文档里即视为 repo 泛词（`notepad`/`client`/`窗口` 之类），
+# 不参与覆盖率 / 词频 / 近邻打分；路由层直接剔除。文档数太少时比例不稳，不做抑制。
+_GENERIC_DF_RATIO = 0.30
+_IDF_MIN_DOCS = 20
+# FTS5 词表虚拟表（fts5vocab）：算词块文档频率用，惰性创建，建不出来就退化为不做抑制
+_VOCAB_TABLE = "search_vocab"
+_vocab_ready = False
 
 _HAN = r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
 _SEG_RE = re.compile(f'("{_HAN}+"|{_HAN}+|[0-9A-Za-z]+)')
@@ -238,7 +271,13 @@ def _cluster_units(units: list[dict[str, str]]) -> list[list[dict[str, str]]]:
 
 
 def build_match_expr(units: list[dict[str, str]]) -> str:
-    """单元分组后拼 FTS5 表达式：组内 OR（宽召回），组间 AND，短语/单词自成一组。"""
+    """单元分组后拼 FTS5 表达式：组内 OR（宽召回），组间 AND，短语/单词自成一组。
+
+    **长句例外**：自然语言原句会被切成十几个段（「ctrl+中键呼出…整个电脑都卡很久」→ 8 段），
+    段间 AND 会把命中压到 1–2 篇（实测口语原句 `mode=lex` 只剩 2 条，目标文件根本不在候选里，
+    重排也救不了）。段数超过 `_MAX_AND_GROUPS` 时退化成「全部单元 OR」+ 覆盖率排序——
+    与选库路由同一策略：宽召回，靠 `_score` 的覆盖率/词频/近邻把最相关的排上来。
+    """
     def term(u: dict[str, str]) -> str:
         t = u["text"]
         if u["type"] == "char":
@@ -248,26 +287,47 @@ def build_match_expr(units: list[dict[str, str]]) -> str:
             return f'"{phrase}"'
         return f'"{t}"'
 
+    groups = _cluster_units(units)
+    if len(groups) > _MAX_AND_GROUPS:
+        terms = list(dict.fromkeys(term(u) for g in groups for u in g))
+        return " OR ".join(terms)
     parts: list[str] = []
-    for g in _cluster_units(units):
+    for g in groups:
         terms = [term(u) for u in g]
         parts.append("(" + " OR ".join(terms) + ")" if len(terms) > 1 else terms[0])
     return " AND ".join(parts)
 
 
-def _route_stop_bigram(t: str) -> bool:
-    """含任一低信息单字的 bigram 视为噪声（如「需要」「一个」）。"""
-    return any(ch in _ROUTE_STOP_CHARS for ch in t)
+def _route_keep_bigram(t: str) -> bool:
+    """整块都是低信息单字才算噪声（如「需要」「一个」）。
+
+    旧规则「含任一低信息字就丢」会连「卡很」（卡了很久）一起丢掉——正是关键症状词，
+    所以改成只看整块。
+    """
+    return not all(ch in _ROUTE_STOP_CHARS for ch in t)
 
 
 def route_terms(query: str, *, limit: int = _ROUTE_MAX_TERMS) -> list[str]:
-    """选库路由用的关键词块：中文二元 OR（剔除低信息 bigram）+ 英文整词；去重保序。
+    """选库路由用的关键词块：中文二元 OR + 关键单字 + 同义扩展 + 英文整词；去重保序。
 
     与 `parse_query` 的关键区别：**不做段间 AND**——复杂长需求按段间 AND 会直接
     零命中（这正是 `/api/search` 对长句失效的原因）；这里全部 OR 召回，再按覆盖打分。
+    单字只在本身**不是**低信息字时保留（「卡」「慢」「死」），否则会退化成全库命中。
     """
     out: list[str] = []
     seen: set[str] = set()
+
+    def add(t: str) -> bool:
+        if not t or t in seen:
+            return False
+        seen.add(t)
+        out.append(t)
+        for syn in _SYNONYMS.get(t, ()):     # 同义扩展：口语词 → 代码/文档用词
+            if syn not in seen:
+                seen.add(syn)
+                out.append(syn)
+        return len(out) >= limit
+
     for m in _SEG_RE.finditer(query or ""):
         seg = m.group(0).strip('"')
         if not seg:
@@ -275,22 +335,71 @@ def route_terms(query: str, *, limit: int = _ROUTE_MAX_TERMS) -> list[str]:
         if seg[0].isascii():
             toks = [seg.lower()]
         elif len(seg) == 1:
-            continue    # 单字前缀召回噪声大，选库不用
+            toks = [] if seg in _ROUTE_STOP_CHARS else [seg]
         else:
-            toks = [seg[i : i + 2] for i in range(len(seg) - 1)]
-            toks = [t for t in toks if not _route_stop_bigram(t)]
+            toks = [t for t in (seg[i : i + 2] for i in range(len(seg) - 1)) if _route_keep_bigram(t)]
         for t in toks:
-            if t and t not in seen:
-                seen.add(t)
-                out.append(t)
-                if len(out) >= limit:
-                    return out
-    return out
+            if add(t):
+                return out[:limit]
+    return out[:limit]
 
 
 def route_match_expr(terms: list[str]) -> str:
-    """选库路由的 FTS5 表达式：全部关键词块 **OR** 召回（无段间 AND）。"""
-    return " OR ".join(f'"{t}"' for t in terms if t)
+    """选库路由的 FTS5 表达式：全部关键词块 **OR** 召回（无段间 AND）。
+
+    单个**汉字**按前缀匹配——索引里存的是 bigram，`"卡"` 精确匹配不到任何 token；
+    单个 ASCII 字符（`l` 之类）**不**做前缀，否则前缀会命中所有英文单词，召回噪声爆炸。
+    """
+    parts = [
+        f'"{t}" *' if len(t) == 1 and not t.isascii() else f'"{t}"'
+        for t in terms if t
+    ]
+    return " OR ".join(parts)
+
+
+def _ensure_vocab(conn) -> bool:
+    """惰性创建 FTS5 词表虚拟表（fts5vocab）：算词块 df 用。建不出来则退化为不做抑制。"""
+    global _vocab_ready
+    if _vocab_ready:
+        return True
+    try:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS {_VOCAB_TABLE} USING fts5vocab(search_fts, 'row')"
+        )
+        conn.commit()
+        _vocab_ready = True
+    except Exception:  # noqa: BLE001 - 老版本 SQLite / 未编译 fts5vocab
+        return False
+    return True
+
+
+def term_idf(conn, terms: Iterable[str]) -> dict[str, float]:
+    """词块 → IDF 权重：`log((N+1)/(df+1)) + 1`；泛词（df/N ≥ `_GENERIC_DF_RATIO`）记 0.0。
+
+    调用方据 0.0 剔除/降权（见 `_score` / `route`），把 `notepad`/`client`/`窗口` 这类
+    repo 泛词从排序驱动因素里摘出去。
+    """
+    ts = [t for t in dict.fromkeys(terms) if t]
+    if not ts:
+        return {}
+    total = int(conn.execute("SELECT COUNT(*) AS c FROM search_docs").fetchone()["c"] or 0)
+    if total < _IDF_MIN_DOCS or not _ensure_vocab(conn):
+        return {t: 1.0 for t in ts}
+    placeholders = ",".join(f":t{i}" for i in range(len(ts)))
+    df = {
+        str(r["term"]): int(r["doc"] or 0)
+        for r in conn.execute(
+            f"SELECT term, doc FROM {_VOCAB_TABLE} WHERE term IN ({placeholders})",
+            {f"t{i}": t for i, t in enumerate(ts)},
+        )
+    }
+    out: dict[str, float] = {}
+    for t in ts:
+        d = df.get(t, 0)
+        out[t] = 0.0 if d and d / total >= _GENERIC_DF_RATIO else round(
+            math.log((total + 1) / (d + 1)) + 1.0, 4
+        )
+    return out
 
 
 def highlight(text: str, matches: list[str], limit: int = 200) -> str:
@@ -449,32 +558,53 @@ def _snippet(
 # ── 命中打分（覆盖率 + 短语）─────────────────────────────
 
 
-def _score(body_low: str, units: list[dict[str, str]], bm25_rank: float) -> dict[str, Any]:
+def _score(
+    body_low: str,
+    units: list[dict[str, str]],
+    bm25_rank: float,
+    idf: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """相关性元数据：短语命中 / 覆盖率 / 词频 / 近邻度 / bm25 → 加权总分。
 
     权重见 `_W_*`：短语 3、覆盖率 2、词频与近邻各 1、bm25 1.5（bm25 取负后加分）。
     词频封顶（`_TF_CAP`），近邻度按命中词块首现位置的跨度衰减（`_PROX_SPAN`）。
+    `idf` 非空时按词块 IDF 加权，权重为 0 的泛词（`term_idf` 判定）不参与打分。
     """
     phrases = 0
-    covered = 0
-    total = 0
-    tf_sum = 0
+    covered = 0.0
+    total = 0.0
+    raw_total = 0
+    tf_sum = 0.0
     positions: list[int] = []
+    matched: list[dict[str, Any]] = []
+    missed: list[str] = []
     for u in units:
         if u["type"] == "char":
             continue  # 单字信息量太低，不参与覆盖率/词频
         text = u["text"].lower()
-        total += 1
+        raw_total += 1
+        w = 1.0 if not idf else float(idf.get(u["text"], 1.0))
+        if w <= 0.0:
+            continue  # 泛词：repo 里到处都有，不能驱动排序
+        total += w
         hits = body_low.count(text)
         if not hits:
+            missed.append(u["text"])
             continue
-        covered += 1
-        tf_sum += min(hits, _TF_CAP)
+        covered += w
+        tf_sum += w * min(hits, _TF_CAP)
         positions.append(body_low.find(text))
+        matched.append({
+            "text": u["text"],
+            "weight": round(w, 3),
+            "hits": min(hits, 999),
+            "type": u["type"],
+        })
         if u["type"] == "phrase":
             phrases += 1
-    coverage = (covered / total) if total else 1.0
-    tf_score = (tf_sum / (_TF_CAP * total)) if total else 1.0
+    # 全部词块都被判成泛词时没有可用分母：给 0，别让所有文档共享 100% 覆盖率
+    coverage = (covered / total) if total else (1.0 if raw_total == 0 else 0.0)
+    tf_score = (tf_sum / (_TF_CAP * total)) if total else (1.0 if raw_total == 0 else 0.0)
     if len(positions) >= 2:
         spread = max(positions) - min(positions)
         proximity = 1.0 / (1.0 + spread / _PROX_SPAN)
@@ -495,7 +625,94 @@ def _score(body_low: str, units: list[dict[str, str]], bm25_rank: float) -> dict
         "tf": round(tf_score, 3),
         "proximity": round(proximity, 3),
         "score": round(score, 4),
+        # 逐词块明细（「判断依据」对话框用）：命中的词块 + 权重 + 出现次数 / 没命中的词块
+        "terms_matched": matched,
+        "terms_missed": missed,
+        "terms_weighted": round(total, 3),
     }
+
+
+# ── 「判断依据」（命中项为什么排在这里）────────────────────
+#
+# 打分明细本来就在 hit 里（coverage/tf/proximity/bm25/vec/score），但那是"零件"；
+# 这里把它整理成一句人能读的解释 + 逐词块明细，供搜索页「依据」对话框直接渲染。
+
+
+def _explain(meta: dict[str, Any], bm25_rank: float, idf: dict[str, float], mode: str) -> dict[str, Any]:
+    """命中项的打分依据：分项（权重 × 取值 = 得分）+ 逐词块 + 一句结论。"""
+    vec = float(meta.get("vec") or 0.0)
+    parts = {
+        "phrase": {"weight": _W_PHRASE, "value": meta["phrase_hits"],
+                   "score": round(_W_PHRASE * meta["phrase_hits"], 4)},
+        "coverage": {"weight": _W_COVERAGE, "value": meta["coverage"],
+                     "score": round(_W_COVERAGE * meta["coverage"], 4)},
+        "tf": {"weight": _W_TF, "value": meta["tf"], "score": round(_W_TF * meta["tf"], 4)},
+        "proximity": {"weight": _W_PROX, "value": meta["proximity"],
+                      "score": round(_W_PROX * meta["proximity"], 4)},
+        "bm25": {"weight": _W_BM25, "value": round(bm25_rank, 4),
+                 "score": round(-_W_BM25 * bm25_rank, 4)},
+        "vec": {"weight": _W_VEC, "value": round(vec, 4), "score": round(_W_VEC * vec, 4)},
+    }
+    matched = list(meta.get("terms_matched") or [])
+    missed = list(meta.get("terms_missed") or [])
+    generic = [t for t, w in (idf or {}).items() if w <= 0.0]
+    weighted = float(meta.get("terms_weighted") or 0.0)
+    bits: list[str] = []
+    if mode == "sem":
+        bits.append("纯语义模式：总分就是语义相似度")
+    if matched:
+        top = sorted(matched, key=lambda x: (-float(x["weight"]), -int(x["hits"])))[:5]
+        bits.append("命中词块 " + "、".join(
+            f"{x['text']}(权重{x['weight']}×{x['hits']}次)" for x in top
+        ))
+    else:
+        bits.append("没有任何词块命中（纯语义召回）")
+    bits.append(
+        f"覆盖率 {meta['coverage']}（权重和 {weighted}）、词频 {meta['tf']}、"
+        f"近邻 {meta['proximity']}、bm25 {round(bm25_rank, 2)}、语义 {round(vec, 3)}"
+    )
+    if generic:
+        bits.append("被判为 repo 泛词、未参与打分：" + "、".join(generic[:8]))
+    if missed:
+        bits.append("未命中：" + "、".join(missed[:8]))
+    return {
+        "mode": mode,
+        "parts": parts,
+        "terms": matched,
+        "terms_missed": missed,
+        "terms_generic": generic,
+        "weights": {"phrase": _W_PHRASE, "coverage": _W_COVERAGE, "tf": _W_TF,
+                    "proximity": _W_PROX, "bm25": _W_BM25, "vec": _W_VEC,
+                    "tf_cap": _TF_CAP, "prox_span": _PROX_SPAN,
+                    "generic_ratio": _GENERIC_DF_RATIO},
+        "summary": "；".join(bits) + "。",
+    }
+
+
+def _annotate_ranks(hits: list[dict[str, Any]], *, order_by: str) -> None:
+    """回填名次与「和下一条的差距」：排序依据 + 主要分项差异（对话框里的"为什么在它前面"）。"""
+    for i, h in enumerate(hits):
+        ex = h.get("explain")
+        if not isinstance(ex, dict):
+            continue
+        ex["rank"] = i + 1
+        ex["of"] = len(hits)
+        ex["order_by"] = order_by
+        nxt = hits[i + 1] if i + 1 < len(hits) else None
+        if nxt is None or not isinstance(nxt.get("explain"), dict):
+            continue
+        delta = {
+            k: round(float(ex["parts"][k]["score"]) - float(nxt["explain"]["parts"][k]["score"]), 4)
+            for k in ex["parts"]
+        }
+        top = sorted(delta.items(), key=lambda kv: -abs(kv[1]))[:3]
+        ex["vs_next"] = {
+            "path": nxt.get("rel") or nxt.get("path") or "",
+            "score_gap": round(float(h.get("score") or 0) - float(nxt.get("score") or 0), 4),
+            "rerank_gap": round(float(h.get("rerank") or 0) - float(nxt.get("rerank") or 0), 4),
+            "parts_delta": delta,
+            "main_reason": "、".join(f"{k} {v:+.3f}" for k, v in top if abs(v) > 1e-9) or "各分项接近",
+        }
 
 
 # ── 索引维护 ────────────────────────────────────────────
@@ -630,12 +847,75 @@ def _bump_progress() -> None:
         _reindex_state["done"] = int(_reindex_state.get("done", 0)) + 1
 
 
-# ── 代码库索引源：本机目录（source="code"）──────────────────
+# ── 本机目录索引源：代码库根 + 知识库工作区（source="code"）────────
 #
-# 与笔记/知识库并列的第三类索引源：把本机代码仓库目录纳入检索。
-# 目录来自设置 `code_roots`（app_settings，运行时可改，无需重启），
-# 扫描按 `CODE_EXTS` 过滤、跳过 `CODE_SKIP_DIRS`（依赖/构建产物/缓存），
-# 命中统一带 source="code"、kb_name=label（目录名），可像知识库一样按库过滤/分面。
+# 与笔记/知识库并列的第三类索引源：把本机目录纳入检索。
+# 目录有两种登记方式（见 `local_libs`）：
+#   - `code_roots`（app_settings，运行时可改）：代码库根，TTL 自动刷新；
+#   - 知识库工作区：只在**手动「创建索引」**时扫描（不自动、不上传 depot）。
+# 扫描按 `CODE_EXTS` 过滤、跳过 `CODE_SKIP_DIRS`、受 `CODE_MAX_*` 体量上限约束，
+# 命中统一带 source="code"、kb_name=label，可像知识库一样按库过滤/分面。
+
+LOCAL_LIB_CODE = "code"     # 手动配置的代码库根
+LOCAL_LIB_KB_WS = "kbws"    # 知识库工作区（手动建索引）
+LOCAL_LIB_PKG = "pkg"       # rez 源码包（货架下一级目录，手动建索引）
+
+# rez 源码包货架（`rez-package-source`）根目录；空/不存在时该来源整体不出现。
+# `package.py` 里按 `{root}` 相对定位（`{root}` = <shelf>/<pkg>/<ver>）。
+SETTING_PKG_ROOT = "code_pkg_root"
+
+
+def pkg_root(conn=None) -> Path | None:
+    """rez 源码包货架目录：页面设置 > 环境变量 `L_NOTEPAD_PKG_ROOT`。"""
+    raw = ""
+    if conn is not None:
+        try:
+            from . import search_vec
+
+            raw = str(search_vec.get_setting(conn, SETTING_PKG_ROOT) or "")
+        except Exception:  # noqa: BLE001 - 设置表缺失时退回环境变量
+            raw = ""
+    raw = raw.strip() or os.environ.get("L_NOTEPAD_PKG_ROOT", "").strip()
+    if not raw:
+        return None
+    path = Path(raw.strip('"'))
+    try:
+        if not path.is_dir():
+            return None
+        return path.resolve()      # 包定义里给的是 `{root}/../../../rez-package-source`，规范化掉 `..`
+    except OSError:
+        return None
+
+
+def rez_packages(conn=None) -> list[Path]:
+    """货架下的 rez 源码包目录（`package.py` 在包根或 `<版本>/package.py`）。"""
+    root = pkg_root(conn)
+    if root is None:
+        return []
+    out: list[Path] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        try:
+            if (entry / "package.py").is_file():
+                out.append(entry)
+                continue
+            if any(
+                (child / "package.py").is_file()
+                for child in entry.iterdir()
+                if child.is_dir()
+            ):
+                out.append(entry)
+        except OSError:
+            continue
+    return out
+
+# 本机库最近一次扫描运行态：label -> {files, bytes, touched, capped, at, duration_ms}
+_code_state: dict[str, dict[str, Any]] = {}
 
 
 def _code_key(label: str, rel: str) -> str:
@@ -684,8 +964,19 @@ def set_code_roots(conn, roots: list[str]) -> None:
 
 
 def _scan_code(conn, label: str, root: Path, *, progress: bool = False) -> int:
-    """扫描一个代码库目录（CODE_EXTS 过滤 + CODE_SKIP_DIRS 剪枝 + 大小上限）。"""
+    """扫描一个本机库目录（CODE_EXTS 过滤 + CODE_SKIP_DIRS 剪枝 + 体量上限）。
+
+    超过 `CODE_MAX_FILES` / `CODE_MAX_BYTES` 即停止扫描，并在运行态标记 `capped`
+    （指向整棵树时不会把服务拖死）。运行态见 `code_lib_state()`。
+    """
+    started = time.monotonic()
     if not root.exists():
+        with _lock:
+            _code_state[label] = {
+                "exists": False, "root": str(root), "files": 0, "bytes": 0,
+                "touched": 0, "capped": False, "at": _iso(time.time()),
+                "duration_ms": 0,
+            }
         return 0
     known = {
         str(r["rel"]): (int(r["size"]), float(r["mtime"]))
@@ -695,6 +986,9 @@ def _scan_code(conn, label: str, root: Path, *, progress: bool = False) -> int:
         )
     }
     touched = 0
+    files = 0
+    total_bytes = 0
+    capped = False
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
             d for d in dirnames if d not in CODE_SKIP_DIRS and not d.endswith(".egg-info")
@@ -703,12 +997,19 @@ def _scan_code(conn, label: str, root: Path, *, progress: bool = False) -> int:
             p = Path(dirpath) / fn
             if p.suffix.lower() not in CODE_EXTS:
                 continue
+            if (CODE_MAX_FILES and files >= CODE_MAX_FILES) or (
+                CODE_MAX_BYTES and total_bytes >= CODE_MAX_BYTES
+            ):
+                capped = True
+                break
             try:
                 st = p.stat()
             except OSError:
                 continue
             if st.st_size > MAX_INDEX_BYTES:
                 continue
+            files += 1
+            total_bytes += st.st_size
             rel = p.relative_to(root).as_posix()
             prev = known.pop(rel, None)
             if prev is None or prev[0] != st.st_size or abs(prev[1] - st.st_mtime) >= 1e-6:
@@ -723,10 +1024,161 @@ def _scan_code(conn, label: str, root: Path, *, progress: bool = False) -> int:
                     conn.commit()
             if progress:
                 _bump_progress()
-    for rel in known:   # 磁盘上已消失的
-        _drop(conn, _code_key(label, rel))
-        touched += 1
+        if capped:
+            break
+    if not capped:      # 只有完整扫完才能判定「磁盘上已消失的」（截断时不能误删）
+        for rel in known:
+            _drop(conn, _code_key(label, rel))
+            touched += 1
+    with _lock:
+        _code_state[label] = {
+            "exists": True, "root": str(root), "files": files, "bytes": total_bytes,
+            "touched": touched, "capped": capped, "at": _iso(time.time()),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
     return touched
+
+
+def code_lib_state(label: str = "") -> dict[str, Any] | list[dict[str, Any]]:
+    """本机库最近一次扫描运行态（`label` 为空则返回全部）。"""
+    with _lock:
+        if label:
+            return dict(_code_state.get(label) or {})
+        return [{"label": k, **v} for k, v in sorted(_code_state.items())]
+
+
+def local_libs(conn) -> list[dict[str, Any]]:
+    """可建索引的本机目录库：[{label, root, kind, name, exists}]。
+
+    - `kind='code'`：`code_roots` 配置的目录（TTL 自动刷新与手动重建都会扫）；
+    - `kind='kbws'`：知识库配置的**工作区目录**（只在手动「创建索引」时扫）。
+
+    工作区走本机索引而非 depot 归档，是为了「手动、不上传」：`.py` 进本地索引但不进
+    depot 上传白名单（`workspace_sync.WORKSPACE_EXTS` 仍是文档类型），所以既不会被动
+    上传占配额，也不会被归档同步删掉。标签与 `code_roots` 共用去重规则，保证索引行的
+    `kb_name` 与页面上的库一一对应；同一个目录只登记一次（避免重复索引）。
+    """
+    out: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+    paths: set[str] = set()
+    for label, root in code_roots(conn):
+        seen[label] = 1
+        try:
+            paths.add(str(root.resolve()))
+        except OSError:
+            paths.add(str(root))
+        out.append({"label": label, "root": root, "kind": LOCAL_LIB_CODE, "name": label})
+    try:
+        from . import knowledge
+
+        bases = knowledge.list_bases(conn)
+    except Exception:  # noqa: BLE001 - 知识库表缺失时只给代码库
+        bases = []
+    for b in bases:
+        name = str(b.get("name") or "").strip()
+        ws = str(b.get("workspace") or "").strip()
+        if not name or not ws:
+            continue
+        root = Path(ws)
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root)
+        if key in paths:
+            continue
+        paths.add(key)
+        base = root.name or name
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        out.append({
+            "label": base if n == 1 else f"{base}{n}",
+            "root": root,
+            "kind": LOCAL_LIB_KB_WS,
+            "name": name,
+        })
+    for pkg_dir in rez_packages(conn):
+        try:
+            key = str(pkg_dir.resolve())
+        except OSError:
+            key = str(pkg_dir)
+        if key in paths:
+            continue
+        paths.add(key)
+        name = pkg_dir.name
+        n = seen.get(name, 0) + 1
+        seen[name] = n
+        out.append({
+            "label": name if n == 1 else f"{name}{n}",
+            "root": pkg_dir,
+            "kind": LOCAL_LIB_PKG,
+            "name": name,
+        })
+    for item in out:
+        try:
+            item["exists"] = item["root"].is_dir()
+        except OSError:
+            item["exists"] = False
+    return out
+
+
+def local_lib_map(conn) -> dict[str, Path]:
+    """标签 → 本机目录（读取命中文件 / 向量嵌入用；重名已由 `local_libs` 消歧）。"""
+    return {str(item["label"]): item["root"] for item in local_libs(conn)}
+
+
+def _lib_has_docs(conn, label: str) -> bool:
+    """该本机库是否已有索引行（手动库「建过才重建」的判据）。"""
+    row = conn.execute(
+        "SELECT 1 FROM search_docs WHERE source = 'code' AND kb_name = ? LIMIT 1", (label,)
+    ).fetchone()
+    return row is not None
+
+
+def lib_rows(conn) -> list[dict[str, Any]]:
+    """本机库 + 已索引文档数（搜索页勾选列表与索引管理共用）。"""
+    docs = {
+        str(r["kb_name"]): int(r["docs"])
+        for r in conn.execute(
+            "SELECT kb_name, COUNT(*) AS docs FROM search_docs WHERE source = 'code' GROUP BY kb_name"
+        )
+    }
+    out: list[dict[str, Any]] = []
+    for lib in local_libs(conn):
+        label = str(lib["label"])
+        out.append({
+            "label": label,
+            "kind": lib["kind"],
+            "name": lib["name"],
+            "root": str(lib["root"]),
+            "exists": bool(lib["exists"]),
+            "docs": docs.get(label, 0),
+            "scan": code_lib_state(label) or {},
+        })
+    return out
+
+
+def index_local_lib(conn, label: str, *, progress: bool = False) -> dict[str, Any]:
+    """手动为一个本机库建索引（搜索页「创建索引」）。找不到标签抛 `KeyError`。"""
+    lib = next((x for x in local_libs(conn) if x["label"] == label), None)
+    if lib is None:
+        raise KeyError(label)
+    started = time.monotonic()
+    touched = _scan_code(conn, label, lib["root"], progress=progress)
+    conn.commit()
+    state = code_lib_state(label)
+    _record_history(conn, kind="code", trigger="manual", target=label, changed=touched,
+                    total=int(state.get("files") or 0),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    detail=f"手动创建索引（{lib['kind']}）：{lib['root']}")
+    return {
+        "label": label,
+        "kind": lib["kind"],
+        "name": lib["name"],
+        "root": str(lib["root"]),
+        "exists": bool(lib["exists"]),
+        "touched": touched,
+        **state,
+    }
 
 
 # ── 知识库索引源：depot 已上传归档 ────────────────────────
@@ -1017,19 +1469,30 @@ def _refresh(conn, notes_root: Path, *, force: bool = False) -> int:
         except (OSError, ValueError):
             continue
         touched += 1
-    # 2) TTL 全量比对（笔记目录 + 代码库；知识库归档由后台线程按事件/TTL 同步，请求路径不走网络）
+    # 2) TTL 全量比对（笔记目录 + 代码库根；知识库归档由后台线程按事件/TTL 同步，请求路径不走网络）。
+    # 知识库工作区（local_libs 的 kbws）**不在这里**——只能手动「创建索引」触发。
     if due:
         for source, kb_name, src_root in _sources(conn, root):
             touched += _scan(conn, source, kb_name, src_root)
         for label, croot in code_roots(conn):
             touched += _scan_code(conn, label, croot)
+        try:
+            _ensure_vocab(conn)     # 泛词抑制用的词表：在写路径上建，检索路径不抢写锁
+        except Exception:  # noqa: BLE001
+            pass
     if touched:
         conn.commit()
     return touched
 
 
 def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
-    """清空并全量重建索引（笔记目录 + 各知识库归档）。"""
+    """清空并全量重建索引（笔记目录 + 本机库 + 各知识库归档）。
+
+    手动库（`kbws` 知识库工作区 / `pkg` rez 源码包）**只重建「之前建过索引的」**：
+    否则一次重建就会把整个货架（54 个包 / 3 万+ 文件）铺开——那不是"重建"，是失控。
+    没建过的库要按需在搜索页「索引管理」里手动建；TTL 自动刷新只扫代码库根（`code`）。
+    """
+    libs = [x for x in local_libs(conn) if x["kind"] == LOCAL_LIB_CODE or _lib_has_docs(conn, str(x["label"]))]
     with _refresh_lock:
         conn.execute("DELETE FROM search_fts")
         conn.execute("DELETE FROM search_docs")
@@ -1049,8 +1512,8 @@ def _rebuild(conn, notes_root: Path, *, progress: bool = False) -> int:
         for source, kb_name, root in _sources(conn, Path(notes_root)):
             touched += _scan(conn, source, kb_name, root, progress=progress)
             conn.commit()
-        for label, croot in code_roots(conn):
-            touched += _scan_code(conn, label, croot, progress=progress)
+        for lib in libs:
+            touched += _scan_code(conn, str(lib["label"]), lib["root"], progress=progress)
             conn.commit()
         for name in kb_bases(conn):
             touched += _kb_sync_one(conn, name, progress=progress)
@@ -1337,17 +1800,21 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
             item.update(_verify_kb(conn, str(item["kb_name"])))
     sources.extend(kb_rows)
 
-    for label, croot in code_roots(conn):
-        row = by_source.get(("code", label))
+    for lib in local_libs(conn):
+        row = by_source.get(("code", str(lib["label"])))
+        state = code_lib_state(str(lib["label"]))
         sources.append({
             "source": "code",
-            "kb_name": label,
-            "root": str(croot),
-            "exists": croot.is_dir(),
+            "kb_name": lib["label"],
+            "root": str(lib["root"]),
+            "exists": bool(lib["exists"]),
+            "kind": lib["kind"],
+            "editable": lib["kind"] == LOCAL_LIB_CODE,   # 只有代码库根可改（工作区在知识库页配）
             "docs": int(row["docs"]) if row else 0,
             "bytes": int(row["bytes"] or 0) if row else 0,
             "last_indexed_at": (row["last_indexed_at"] if row else "") or "",
             "newest_mtime": _iso(float(row["newest_mtime"])) if row and row["newest_mtime"] else "",
+            "scan": state or {},
         })
 
     with _lock:
@@ -1376,6 +1843,17 @@ def stats(conn, notes_root: Path, *, deep: bool = False) -> dict[str, Any]:
         "workspace_exts": sorted(WORKSPACE_EXTS),
         "code_exts": sorted(CODE_EXTS),
         "code_roots": [{"label": lb, "root": str(rp)} for lb, rp in code_roots(conn)],
+        "code_max_files": CODE_MAX_FILES,
+        "code_max_bytes": CODE_MAX_BYTES,
+        "code_libs": [
+            {
+                "label": lib["label"], "kind": lib["kind"], "name": lib["name"],
+                "root": str(lib["root"]), "exists": bool(lib["exists"]),
+                "docs": int(by_source[("code", str(lib["label"]))]["docs"])
+                if ("code", str(lib["label"])) in by_source else 0,
+            }
+            for lib in local_libs(conn)
+        ],
         "kb_scan_ttl_s": KB_SCAN_TTL_S,
         "kb_pending": kb_pending,
         "warm": warm_state(),
@@ -1416,6 +1894,18 @@ __all__ = [
     "warm_state",
     "MAX_INDEX_BYTES",
     "WORKSPACE_EXTS",
+    "CODE_EXTS",
+    "CODE_MAX_FILES",
+    "CODE_MAX_BYTES",
+    "code_roots",
+    "code_lib_state",
+    "local_libs",
+    "local_lib_map",
+    "index_local_lib",
+    "route_terms",
+    "route_match_expr",
+    "term_idf",
+    "route",
 ]
 
 
@@ -1520,6 +2010,17 @@ def _apply_rerank(
     smap = dict(scores)
     for i, hit in enumerate(cand):
         hit["rerank"] = round(float(smap.get(i, 0.0)), 4)
+        ex = hit.get("explain")
+        if isinstance(ex, dict):     # 「判断依据」里说明重排分怎么参与排序
+            ex["rerank"] = hit["rerank"]
+            ex["rerank_used"] = True
+            ex["summary"] = f"{ex.get('summary', '')}重排分 {hit['rerank']}（cross-encoder，排序主序）。"
+    for hit in hits:
+        ex = hit.get("explain")
+        if isinstance(ex, dict) and not ex.get("rerank_used"):
+            ex["rerank_used"] = False
+            if info.get("used"):
+                ex["summary"] = f"{ex.get('summary', '')}本轮未参与重排（无候选块），排在已重排候选之后。"
     ranked = sorted(cand, key=lambda h: (-h["rerank"], -h["score"], h["path"]))
     ranked_ids = {id(h) for h in ranked}
     return ranked + [h for h in hits if id(h) not in ranked_ids], info
@@ -1538,6 +2039,7 @@ def search(
     mode: str = "hybrid",
     kb_name: str = "",
     rerank: bool | None = None,
+    packages: list[str] | None = None,
 ) -> dict[str, Any]:
     """倒排检索（只查索引表，不读文档）。
 
@@ -1545,7 +2047,8 @@ def search(
     最后按需用本地重排服务对候选块做交叉编码重排（不可用时静默退回融合排序）。
     `"引号"` 精确短语无结果时自动回退为整串模糊匹配（`fallback=True`）。
     `rerank`：None 用全局配置，False 本次关闭（全局关闭时传 True 也不生效）。
-    返回 {total, hits, took_ms, fallback, vec, rerank}；hit 含 source（note/kb）、kb_name、rel、path、
+    `packages`：只保留这些 rez 源码包（`source=code` 的 `kb_name`）的代码命中；笔记/知识库不受影响。
+    返回 {total, hits, took_ms, fallback, vec, rerank}；hit 含 source（note/kb/code）、kb_name、rel、path、
     snippet、matches、chunk、chunk_no、chunk_offset、rerank、coverage、tf、proximity、phrase_hits、bm25、score。
     """
     empty: dict[str, Any] = {
@@ -1564,15 +2067,8 @@ def search(
     limit = max(1, min(int(limit or 20), MAX_LIMIT))
     offset = max(0, int(offset or 0))
 
-    src_clause = ""
     params: dict[str, Any] = {"q": match, "user": user, "admin": 1 if admin else 0}
-    if sources:
-        names = ",".join(f":src{i}" for i in range(len(sources)))
-        src_clause = f" AND search_docs.source IN ({names})"
-        params.update({f"src{i}": s for i, s in enumerate(sources)})
-    if kb_name:
-        src_clause += " AND search_docs.kb_name = :kb_name"
-        params["kb_name"] = kb_name
+    src_clause = _src_clause(sources, params, prefix="src", kb_name=kb_name, packages=packages)
 
     started = time.perf_counter()
     # 候选：按 bm25 取 (offset+limit)*K 条，再按覆盖率/短语重排（保证相关性优先）
@@ -1595,7 +2091,8 @@ def search(
     vmap: dict[str, float] = {}
     vinfo: dict[str, Any] = {"used": False, "model": "", "hits": 0}
     if mode in ("hybrid", "sem"):
-        vmap, vinfo = _vec_scores(conn, query, user=user, admin=admin, sources=sources, kb_name=kb_name)
+        vmap, vinfo = _vec_scores(conn, query, user=user, admin=admin, sources=sources,
+                                  kb_name=kb_name, packages=packages)
         if mode == "sem" and not vmap:
             # 纯语义模式且语义无命中：不要回退成"词法 total 但列表为空"的误导结果
             reason = _rerank_decision(conn, rerank)[1] or "语义无命中，无可重排候选"
@@ -1605,13 +2102,13 @@ def search(
             # 纯语义：只留有语义分的文档，按相似度排序（词法行用作补全 body/snippet）
             rows = [r for r in rows if r["key"] in vmap] + _vec_only_rows(
                 conn, vmap, [r["key"] for r in rows], user=user, admin=admin,
-                sources=sources, kb_name=kb_name,
+                sources=sources, kb_name=kb_name, packages=packages,
             )
         elif vmap and total == 0:
             # 混合：词法为空时用语义兜底
             rows = list(rows) + _vec_only_rows(
                 conn, vmap, [r["key"] for r in rows], user=user, admin=admin,
-                sources=sources, kb_name=kb_name,
+                sources=sources, kb_name=kb_name, packages=packages,
             )
 
     if total == 0 and not vmap:
@@ -1625,9 +2122,12 @@ def search(
         conn, query, [r["key"] for r in rows], units, semantic=mode in ("hybrid", "sem")
     )
 
+    # 泛词抑制：IDF 权重为 0 的词块（repo 里到处都有）不参与覆盖率/词频/近邻打分
+    idf = term_idf(conn, [u["text"] for u in units])
+
     hits: list[dict[str, Any]] = []
     for r in rows:
-        meta = _score((r["body"] or "").lower(), units, float(r["rank"]))
+        meta = _score((r["body"] or "").lower(), units, float(r["rank"]), idf)
         vec = vmap.get(r["key"], 0.0)
         if vec:
             meta["vec"] = round(vec, 4)
@@ -1654,6 +2154,7 @@ def search(
                 "vec": meta.get("vec", 0.0),
                 "phrase_hits": meta["phrase_hits"],
                 "score": meta["score"],
+                "explain": _explain(meta, float(r["rank"]), idf, mode),
             }
         )
     if mode == "sem":
@@ -1664,6 +2165,9 @@ def search(
     # 重排（本地 cross-encoder）：重排分作主序，未参与重排的候选垫底
     allow_rerank, off_reason = _rerank_decision(conn, rerank)
     hits, rinfo = _apply_rerank(conn, query, hits, allow=allow_rerank, off_reason=off_reason)
+
+    # 「判断依据」：名次 + 与下一条的差距（对话框里解释"为什么它在它前面"）
+    _annotate_ranks(hits, order_by="rerank" if rinfo.get("used") else "score")
 
     page = hits[offset : offset + limit]
     return {
@@ -1688,22 +2192,27 @@ def search_auto(
     sources: list[str] | None = None,
     rerank: bool | None = None,
     kb_name: str = "",
+    packages: list[str] | None = None,
 ) -> dict[str, Any]:
     """词法优先、零命中回退 hybrid —— `mode=auto` 的入口。
 
-    长句 / 自然语言常因多子句被段间 AND 拆开而词法零命中；先 `lex`（毫秒级），
-    只在 `hits` 为空时再做一次 `hybrid`（语义兜底），避免界面显示"无命中"。
+    长句 / 自然语言先 `lex`（毫秒级）。命中太少（< `_AUTO_MIN_HITS`）或本身就是长句
+    （段数 > `_MAX_AND_GROUPS`，词法已退化为 OR 宽召回）时再跑一次 `hybrid`：
+    实测口语原句 `lex` 的排序由「和句子结构像的文档」主导，套上语义+重排才把
+    真正的代码文件顶到第一；`mode_used` 回填实际用了哪个。
     """
     result = search(
         conn, notes_root, query, user=user, admin=admin, limit=limit, offset=offset,
-        sources=sources, mode="lex", rerank=rerank, kb_name=kb_name,
+        sources=sources, mode="lex", rerank=rerank, kb_name=kb_name, packages=packages,
     )
-    if result.get("hits") or int(result.get("total") or 0) > 0:
+    enough = int(result.get("total") or 0) >= _AUTO_MIN_HITS
+    long_query = len(_cluster_units(parse_query(query or ""))) > _MAX_AND_GROUPS
+    if result.get("hits") and enough and not long_query:
         result["mode_used"] = "lex"
         return result
     result = search(
         conn, notes_root, query, user=user, admin=admin, limit=limit, offset=offset,
-        sources=sources, mode="hybrid", rerank=rerank, kb_name=kb_name,
+        sources=sources, mode="hybrid", rerank=rerank, kb_name=kb_name, packages=packages,
     )
     result["mode_used"] = "hybrid"
     return result
@@ -1736,6 +2245,20 @@ def _meta_bases(conn, terms: list[str]) -> list[dict[str, Any]]:
         hits = len(tset & set(_tokens(text)))
         if hits:
             out.append({"kb_name": name, "meta_hits": hits})
+    return out
+
+
+def _code_meta_bases(conn, terms: list[str]) -> list[dict[str, Any]]:
+    """本机库（代码库根 / 知识库工作区）的「元数据命中」：库标签与关键词块的重叠。"""
+    if not terms:
+        return []
+    tset = set(terms)
+    out: list[dict[str, Any]] = []
+    for lib in local_libs(conn):
+        label = str(lib["label"])
+        hits = len(tset & set(_tokens(label)))
+        if hits:
+            out.append({"kb_name": label, "meta_hits": hits})
     return out
 
 
@@ -1844,9 +2367,13 @@ def route(
             语义不可用 / 无命中 → **自动降级为 1** 并在 reason 说明（0.3s TCP 探测兜底，不阻塞）
       3 —— 不处理：需求分解 / 多查询由调用方自行完成（返回空 kbs + 说明）
 
-    返回 {depth_req, depth_used, degraded, reason, reason_code, took_ms, cached, terms, kbs}；
+    返回 {depth_req, depth_used, degraded, reason, reason_code, took_ms, cached, terms,
+    terms_generic_dropped, kbs}；
     kbs 按 score 降序（score = 0.5*log1p(doc_hits) + 2.5*meta_hits + 1.5*vec + 1.5*tanh(-bm25/20)）。
-    同一 (q, req, budget, limit, sources, user) 结果缓存 `_ROUTE_CACHE_TTL` 秒（`cached=true`）。
+    `sources` 决定参与选库的来源：`kb` 知识库归档 / `code` 本机库（代码库根 + 知识库工作区），
+    不传即全部。关键词先做同义扩展（`_SYNONYMS`），再按 IDF 剔除泛词，被剔除的见
+    `terms_generic_dropped`。同一 (q, req, budget, limit, sources, user) 结果缓存
+    `_ROUTE_CACHE_TTL` 秒（`cached=true`）。
     `budget_ms>0 且 <100` 时 `depth>=2` 自动退回 `1`（`reason_code=budget_downgrade`）。
     """
     started = time.perf_counter()
@@ -1884,23 +2411,41 @@ def route(
             "query": query, "depth_req": req_orig, "depth_used": 3,
             "degraded": True, "reason": reason, "reason_code": reason_code,
             "took_ms": round((time.perf_counter() - started) * 1000, 2),
-            "cached": False, "terms": [], "kbs": [],
+            "cached": False, "terms": [], "terms_generic_dropped": [], "kbs": [],
         }
         _route_cache_put(cache_key, result)
         return result
 
     terms = route_terms(query)
+    meta_terms = list(terms)     # 元数据匹配用「剔除泛词前」的词表：库名/标题里的泛词仍是有效信号
+    dropped: list[str] = []
+    if terms:
+        idf = term_idf(conn, terms)
+        keep = [t for t in terms if idf.get(t, 1.0) > 0.0]
+        if keep:    # 全被判成泛词时保留原词表，否则路由会退化成空查询
+            dropped = [t for t in terms if idf.get(t, 1.0) <= 0.0]
+            terms = keep
     entries: dict[str, dict[str, Any]] = {}
     include_kb = (not sources) or ("kb" in sources)
+    include_code = (not sources) or ("code" in sources)
+
+    def _meta_entries() -> dict[str, dict[str, Any]]:
+        """库元数据命中：知识库走 name/title/description，本机库（代码/工作区）走标签。"""
+        out: dict[str, dict[str, Any]] = {}
+        if include_kb:
+            for m in _meta_bases(conn, meta_terms):
+                out[m["kb_name"]] = m
+        if include_code:
+            for m in _code_meta_bases(conn, meta_terms):
+                out.setdefault(m["kb_name"], m)
+        return out
 
     if used >= 1:
         agg = _kb_aggregate(
             conn, notes_root, terms, user=user, admin=admin, sources=sources,
             refresh_index=False,
         )
-        meta = (
-            {m["kb_name"]: m for m in _meta_bases(conn, terms)} if include_kb else {}
-        )
+        meta = _meta_entries()
         for name, info in agg.items():
             entries[name] = {
                 "kb_name": name,
@@ -1919,8 +2464,8 @@ def route(
                     "meta_hits": int(m["meta_hits"]),
                     "vec": 0.0,
                 }
-    elif include_kb:   # depth 0：只靠元数据
-        for m in _meta_bases(conn, terms):
+    elif include_kb or include_code:   # depth 0：只靠元数据
+        for m in _meta_entries().values():
             entries[m["kb_name"]] = {
                 "kb_name": m["kb_name"],
                 "doc_hits": 0,
@@ -1969,6 +2514,7 @@ def route(
         "took_ms": round((time.perf_counter() - started) * 1000, 2),
         "cached": False,
         "terms": terms,
+        "terms_generic_dropped": dropped,
         "kbs": ranked,
     }
     _route_cache_put(cache_key, result)
@@ -1980,9 +2526,17 @@ def _perm_params(user: str, admin: bool) -> dict[str, Any]:
 
 
 def _src_clause(
-    sources: list[str] | None, params: dict[str, Any], prefix: str = "src", kb_name: str = ""
+    sources: list[str] | None,
+    params: dict[str, Any],
+    prefix: str = "src",
+    kb_name: str = "",
+    packages: list[str] | None = None,
 ) -> str:
-    """来源/知识库过滤片段，同时写入 params。"""
+    """来源 / 知识库 / 「搜索哪些包」过滤片段，同时写入 params。
+
+    `packages`（搜索页勾选的 rez 源码包）**只作用于代码库命中**：笔记与知识库照常返回，
+    否则「只勾一个包」会把笔记和知识库都过滤掉。
+    """
     clause = ""
     if sources:
         names = ",".join(f":{prefix}{i}" for i in range(len(sources)))
@@ -1991,11 +2545,22 @@ def _src_clause(
     if kb_name:
         clause += f" AND search_docs.kb_name = :{prefix}kb"
         params[f"{prefix}kb"] = kb_name
+    if packages:
+        names = ",".join(f":{prefix}pkg{i}" for i in range(len(packages)))
+        params.update({f"{prefix}pkg{i}": p for i, p in enumerate(packages)})
+        clause += f" AND (search_docs.source <> 'code' OR search_docs.kb_name IN ({names}))"
     return clause
 
 
 def _vec_scores(
-    conn, query: str, *, user: str, admin: bool, sources: list[str] | None, kb_name: str = ""
+    conn,
+    query: str,
+    *,
+    user: str,
+    admin: bool,
+    sources: list[str] | None,
+    kb_name: str = "",
+    packages: list[str] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """语义召回（含阈值与权限过滤）：返回 ({doc_key: 相似度}, 信息)。"""
     try:
@@ -2027,7 +2592,7 @@ def _vec_scores(
     params = _perm_params(user, admin)
     placeholders = ",".join(f":v{i}" for i in range(len(keys)))
     params.update({f"v{i}": k for i, k in enumerate(keys)})
-    clause = _src_clause(sources, params, prefix="vsrc", kb_name=kb_name)
+    clause = _src_clause(sources, params, prefix="vsrc", kb_name=kb_name, packages=packages)
     allowed = {
         r["key"]
         for r in conn.execute(
@@ -2042,7 +2607,7 @@ def _vec_scores(
 
 def _vec_only_rows(
     conn, vmap: dict[str, float], have_keys: list[str], *, user: str, admin: bool,
-    sources: list[str] | None, kb_name: str = "",
+    sources: list[str] | None, kb_name: str = "", packages: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """语义命中但词法未命中的文档行（rank 记 0），供融合成结果。"""
     keys = [k for k in vmap if k not in set(have_keys)]
@@ -2051,7 +2616,7 @@ def _vec_only_rows(
     params = _perm_params(user, admin)
     placeholders = ",".join(f":d{i}" for i in range(len(keys)))
     params.update({f"d{i}": k for i, k in enumerate(keys)})
-    clause = _src_clause(sources, params, prefix="dsrc", kb_name=kb_name)
+    clause = _src_clause(sources, params, prefix="dsrc", kb_name=kb_name, packages=packages)
     out: list[dict[str, Any]] = []
     for r in conn.execute(
         "SELECT search_docs.note_path AS key, search_docs.source AS source,"

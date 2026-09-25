@@ -60,11 +60,53 @@
       .pager { display: flex; gap: 12px; align-items: center; margin-top: 18px; }
       .empty { padding: 40px 8px; text-align: center; color: var(--muted); line-height: 2; }
       .empty code { background: var(--panel-strong); padding: 1px 5px; border-radius: 5px; }
+      .idx {
+        border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+        padding: 10px 14px; margin: 0 0 12px; font-size: 12.5px;
+      }
+      .idx summary { cursor: pointer; color: var(--muted); }
+      .idx-table { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
+      .idx-table th, .idx-table td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+      .idx-table th { color: var(--muted); font-weight: 600; }
+      .idx-table .path { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; word-break: break-all; }
+      .idx .btn.sm { padding: 4px 9px; font-size: 12px; }
+      .idx-msg { margin-top: 6px; }
+      .pkgs {
+        border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+        padding: 10px 14px; margin: 0 0 12px; font-size: 12.5px;
+      }
+      .pkgs summary { cursor: pointer; color: var(--muted); }
+      .pkgs-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0 6px; }
+      .pkgs-actions .btn.sm { padding: 4px 9px; font-size: 12px; }
+      .pkgs-actions .pkg-filter {
+        flex: 0 1 200px; padding: 4px 9px; border-radius: 8px; font-size: 12px;
+        border: 1px solid var(--border); background: var(--panel-strong); color: inherit;
+      }
+      .pkgs-actions .pkg-filter:focus { outline: none; border-color: var(--border-hover); }
+      .pkgs-grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+        gap: 2px 10px; max-height: 260px; overflow: auto;
+        border-top: 1px solid var(--border); padding-top: 8px;
+      }
+      .pkg {
+        display: flex; align-items: center; gap: 6px; padding: 3px 4px;
+        border-radius: 6px; cursor: pointer; font-size: 12px;
+      }
+      .pkg:hover { background: var(--panel-strong); }
+      .pkg input { margin: 0; }
+      .pkg .pkg-name { font-family: ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .pkg .pkg-kind {
+        font-size: 10px; padding: 0 5px; border-radius: 999px; color: var(--muted);
+        border: 1px solid var(--border); white-space: nowrap;
+      }
+      .pkg .pkg-docs { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+      .pkg.off .pkg-name { color: var(--muted); }
+      .pkg.off .pkg-docs { color: #c98a5b; }
 {% endblock %}
 {% block body %}
 <div class="srch">
   <h2>全局搜索</h2>
-  <div class="hint">一次搜索「我的笔记 + 所有知识库」。结果按相关度排序；下方「搜索帮助」解释每个参数与模式。</div>
+  <div class="hint">一次搜索「我的笔记 + 所有知识库 + 勾选的 rez 源码包」。结果按相关度排序；下方「搜索帮助」解释每个参数与模式。</div>
 
   <form class="srch-bar" method="get" action="{{ web_base }}/search">
     <input class="q" type="text" name="q" value="{{ q|e }}" placeholder="输入关键词，搜索全部笔记与知识库…" autofocus autocomplete="off" list="ln-search-history-page">
@@ -97,8 +139,68 @@
       <option value="{{ n }}" {% if limit == n %}selected{% endif %}>每页 {{ n }}</option>
       {% endfor %}
     </select>
+    <input type="hidden" name="packages" id="pkgs-value" value="{{ pkgs_sel }}">
     <button class="btn primary" type="submit">搜索</button>
   </form>
+
+  {% if pkgs and pkgs.total %}
+  <details class="pkgs" {% if pkgs_sel %}open{% endif %}>
+    <summary>要搜索哪些包：本机库（{{ pkgs.indexed }}/{{ pkgs.total }} 已建索引；不勾选 = 不限）</summary>
+    <div class="pkgs-actions">
+      <input class="pkg-filter" type="text" id="pkgs-filter" placeholder="过滤包名…" autocomplete="off" spellcheck="false">
+      <button class="btn sm" type="button" id="pkgs-none">全不选</button>
+      <button class="btn sm" type="button" id="pkgs-indexed">选“已建索引”</button>
+      <span class="muted" id="pkgs-hint">
+        含代码库根 / rez 源码包（货架：{{ pkgs.root or '未配置' }}）/ 知识库工作区。勾选后只在这些库里搜代码；笔记与知识库照常搜。
+        选择会存到浏览器（换设备/换浏览器需重选）。
+      </span>
+    </div>
+    <div class="pkgs-grid">
+      {% for p in pkgs.catalog %}
+      <label class="pkg{% if not p.docs %} off{% endif %}" title="{{ p.root }}{% if not p.exists %}（目录不存在）{% endif %}">
+        <input type="checkbox" class="pkg-cb" value="{{ p.label }}" {% if p.checked %}checked{% endif %}>
+        <span class="pkg-name">{{ p.label }}</span>
+        <span class="pkg-kind">{% if p.kind == 'code' %}代码库根{% elif p.kind == 'kbws' %}工作区{% else %}rez 包{% endif %}</span>
+        <span class="pkg-docs">{% if p.docs %}{{ p.docs }} 篇{% else %}未建索引{% endif %}</span>
+      </label>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  {% if index_libs %}
+  <details class="idx">
+    <summary>索引管理：本机库「创建索引」（含代码文件）</summary>
+    <table class="idx-table">
+      <thead>
+        <tr><th>库</th><th>类型</th><th>目录</th><th>已索引</th><th>最近扫描</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for lib in index_libs %}
+        <tr>
+          <td><code>{{ lib.label }}</code></td>
+          <td>{% if lib.kind == 'kbws' %}知识库工作区{% else %}代码库根{% endif %}</td>
+          <td class="path">{{ lib.root }}{% if not lib.exists %} <span class="muted">（目录不存在）</span>{% endif %}</td>
+          <td>{{ lib.docs }}</td>
+          <td class="muted">
+            {% if lib.scan %}{{ lib.scan.files }} 文件 / {{ lib.scan.duration_ms }}ms{% if lib.scan.capped %} / <strong>已截断</strong>{% endif %}{% else %}—{% endif %}
+          </td>
+          <td>
+            <button class="btn sm" type="button" data-lib="{{ lib.label }}"
+              {% if not is_admin %}disabled title="需要管理员权限"{% endif %}>创建索引</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="hint">
+      「创建索引」只扫该库目录（`.py`/`.js`/`.json` 等代码与配置都在内），只写本机索引，
+      <strong>不触发 depot 上传</strong>；建完随后台嵌入向量（语义检索可用）。
+      代码库根也会被 TTL 自动刷新；知识库工作区只在手动点这里时重建。
+    </div>
+    <div class="idx-msg" id="idx-msg"></div>
+  </details>
+  {% endif %}
 
   {% if mode_help_current %}<div class="mode-tip">当前模式 —— {{ mode_help_current }}</div>{% endif %}
 
@@ -177,11 +279,78 @@
         box.innerHTML = LN.renderSearchHits(data);
       } else {
         box.innerHTML = data.map(function (h) {
+          var icon = h.source === "kb" ? "📚 " : (h.source === "code" ? "🧩 " : "📝 ");
           return '<div class="hit"><div class="hit-head"><a href="' + (h.open_url || "#") + '">' +
-            (h.source === "kb" ? "📚 " : "📝 ") + (h.rel || "") + "</a></div></div>";
+            icon + (h.source === "code" ? (h.kb_name || "") + " / " : "") + (h.rel || "") + "</a></div></div>";
         }).join("") || '<div class="empty">结果渲染器 app.js 未加载</div>';
       }
     }
+    /* 要搜索哪些包：勾选 → 只在这些 rez 源码包里搜代码；选择存 localStorage */
+    var PKG_KEY = "ln_search_packages";
+    var pkgBoxes = Array.prototype.slice.call(document.querySelectorAll(".pkg-cb"));
+    var pkgValue = document.getElementById("pkgs-value");
+    if (pkgBoxes.length) {
+      var syncPkgs = function () {
+        var picked = pkgBoxes.filter(function (cb) { return cb.checked; })
+          .map(function (cb) { return cb.value; });
+        if (pkgValue) pkgValue.value = picked.join(",");
+        try {
+          if (picked.length) localStorage.setItem(PKG_KEY, picked.join(","));
+          else localStorage.removeItem(PKG_KEY);
+        } catch (e) { /* 隐私模式忽略 */ }
+      };
+      pkgBoxes.forEach(function (cb) { cb.addEventListener("change", syncPkgs); });
+      var noneBtn = document.getElementById("pkgs-none");
+      if (noneBtn) noneBtn.addEventListener("click", function () {
+        pkgBoxes.forEach(function (cb) { cb.checked = false; });
+        syncPkgs();
+      });
+      var idxBtn = document.getElementById("pkgs-indexed");
+      if (idxBtn) idxBtn.addEventListener("click", function () {
+        pkgBoxes.forEach(function (cb) {
+          cb.checked = !cb.closest(".pkg").classList.contains("off");
+        });
+        syncPkgs();
+      });
+      syncPkgs();
+      /* 过滤框：只隐藏列表项，不影响勾选状态（勾了再过滤，提交仍是全部勾选项） */
+      var filterBox = document.getElementById("pkgs-filter");
+      var pkgLabels = Array.prototype.slice.call(document.querySelectorAll(".pkgs-grid .pkg"));
+      var hintBox = document.getElementById("pkgs-hint");
+      var hintText = hintBox ? hintBox.textContent : "";
+      if (filterBox && pkgLabels.length) {
+        filterBox.addEventListener("input", function () {
+          var q = (filterBox.value || "").trim().toLowerCase();
+          var shown = 0;
+          pkgLabels.forEach(function (lab) {
+            var nameEl = lab.querySelector(".pkg-name");
+            var kindEl = lab.querySelector(".pkg-kind");
+            var hay = ((nameEl ? nameEl.textContent : "") + " " +
+                       (kindEl ? kindEl.textContent : "")).toLowerCase();
+            var hit = !q || hay.indexOf(q) >= 0;
+            lab.style.display = hit ? "" : "none";
+            if (hit) shown++;
+          });
+          if (hintBox) {
+            hintBox.textContent = q
+              ? "过滤「" + q + "」：匹配 " + shown + " 个包（勾选状态不受影响）"
+              : hintText;
+          }
+        });
+      }
+      /* 从顶栏进来时 URL 没带 packages：把记住的选择补上（只补一次，避免循环） */
+      var urlPkgs = new URLSearchParams(window.location.search);
+      if (!urlPkgs.get("packages") && !urlPkgs.get("pkgs_saved")) {
+        var saved = "";
+        try { saved = localStorage.getItem(PKG_KEY) || ""; } catch (e) { saved = ""; }
+        if (saved) {
+          urlPkgs.set("packages", saved);
+          urlPkgs.set("pkgs_saved", "1");
+          window.location.replace(window.location.pathname + "?" + urlPkgs.toString());
+        }
+      }
+    }
+
     /* 本页搜索表单提交时写入搜索历史（与顶栏共用 window.lnSearchHistory） */
     var form = document.querySelector(".srch-bar");
     var inp = form && form.querySelector("input.q");
@@ -190,6 +359,43 @@
         if (window.lnSearchHistory) window.lnSearchHistory.add(inp.value);
       });
     }
+
+    /* 索引管理：手动为本机库（代码库根 / 知识库工作区）建索引 */
+    var idxMsg = document.getElementById("idx-msg");
+    Array.prototype.forEach.call(document.querySelectorAll("[data-lib]"), function (btn) {
+      btn.addEventListener("click", function () {
+        var label = btn.getAttribute("data-lib");
+        var old = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "索引中…";
+        if (idxMsg) idxMsg.textContent = "";
+        fetch("{{ root_base }}/api/search/index_lib", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label: label, embed: true })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            btn.disabled = false;
+            btn.textContent = old;
+            if (!d.ok) {
+              if (idxMsg) idxMsg.textContent = "失败：" + (d.error || d.detail || "未知错误");
+              return;
+            }
+            if (idxMsg) {
+              idxMsg.textContent = "「" + label + "」已建索引：" + (d.files || 0) + " 文件，写入 "
+                + (d.touched || 0) + " 行，耗时 " + (d.duration_ms || 0) + "ms"
+                + (d.capped ? "（已达体量上限，已截断）" : "")
+                + (d.embed_started ? "；向量嵌入已在后台开始" : "");
+            }
+          })
+          .catch(function (e) {
+            btn.disabled = false;
+            btn.textContent = old;
+            if (idxMsg) idxMsg.textContent = "请求失败：" + e;
+          });
+      });
+    });
   })();
 </script>
 {% endblock %}

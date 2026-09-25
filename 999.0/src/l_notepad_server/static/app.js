@@ -243,11 +243,24 @@
   }
 
   /* 单条命中 → .hit 片段 */
+  var hitSeq = 0;
+  var hitStore = {};
+
   function renderHit(h) {
     var hot = (h.phrase_hits || 0) > 0;
+    var icon = h.source === "kb" ? "📚 " : (h.source === "code" ? "🧩 " : "📝 ");
+    var libBadge = h.source === "code"
+      ? '<span class="badge lib" title="本机库（代码库根 / 知识库工作区），只读查看">' + esc(h.kb_name || "code") + "</span>"
+      : "";
+    var id = "";
+    if (h.explain) {
+      id = "lnhit" + (++hitSeq);
+      hitStore[id] = h;
+    }
     return '<div class="hit' + (hot ? " hot" : "") + '">' +
       '<div class="hit-head"><a href="' + esc(h.open_url) + '">' +
-      (h.source === "kb" ? "📚 " : "📝 ") + esc(h.rel) + "</a>" +
+      icon + libBadge + esc(h.rel) + "</a>" +
+      (id ? '<button class="why" type="button" data-why="' + id + '" title="为什么它排在这里：展开打分明细">判断依据</button>' : "") +
       '<span class="badge-score" title="综合相关度：3×短语 + 2×覆盖率 + 词频 + 近邻 − 1.5×bm25">' +
       num(h.score, 2) + "</span></div>" +
       '<div class="snip">' + hl(h.snippet, h.matches) + "</div>" +
@@ -266,10 +279,121 @@
       "</div></div>";
   }
 
+  /* ── 「判断依据」对话框：把这个命中项的打分拆开讲清楚 ── */
+  var PART_LABEL = {
+    phrase: "短语命中", coverage: "覆盖率", tf: "词频",
+    proximity: "近邻度", bm25: "bm25", vec: "语义相似度",
+
+  };
+  var PART_TIP = {
+    phrase: "引号短语精确命中次数 × 权重 3",
+    coverage: "命中的词块权重和 ÷ 全部词块权重和（泛词权重记 0，不进分母）× 权重 2",
+    tf: "Σ(词块权重 × 出现次数，单块封顶 " + 5 + " 次) ÷ (封顶 × 权重和) × 权重 1",
+    proximity: "命中词块首现位置的集中程度：1/(1+跨度/200)，命中短语直接记 1 × 权重 1",
+    bm25: "倒排引擎原始分（负值，越负越相关），取负后 × 权重 1.5 加分",
+    vec: "向量余弦相似度 × 权重 1.2（纯语义模式下总分就等于它）",
+  };
+
+  function whyHtml(h) {
+    var ex = h.explain || {};
+    var out = [];
+    out.push(
+      '<div class="why-head">' +
+      (h.source === "code" ? "🧩 " : h.source === "kb" ? "📚 " : "📝 ") +
+      (h.kb_name ? esc(h.kb_name) + " / " : "") + esc(h.rel || "") +
+      "</div>"
+    );
+    var meta = [];
+    if (ex.rank) meta.push("第 <b>" + ex.rank + "</b> / " + ex.of + " 名");
+    if (ex.order_by) meta.push("排序主序：<b>" + (ex.order_by === "rerank" ? "重排分" : "综合分") + "</b>");
+    meta.push("综合分 <b>" + num(h.score, 2) + "</b>");
+    meta.push("实际模式 <b>" + esc(ex.mode || "") + "</b>");
+    out.push('<div class="why-meta">' + meta.join(" · ") + "</div>");
+    out.push('<div class="why-sum">' + esc(ex.summary || "") + "</div>");
+
+    if (ex.parts) {
+      out.push('<table class="why-table"><thead><tr><th>分项</th><th>权重</th><th>取值</th><th>得分</th></tr></thead><tbody>');
+      Object.keys(ex.parts).forEach(function (k) {
+        var p = ex.parts[k];
+        if (k === "vec" && !p.value) return;
+        out.push('<tr title="' + esc(PART_TIP[k] || "") + '"><td>' + esc(PART_LABEL[k] || k) + "</td><td>" +
+          p.weight + "</td><td>" + num(p.value, 3) + "</td><td><b>" + num(p.score, 3) + "</b></td></tr>");
+      });
+      out.push("</tbody></table>");
+    }
+
+    if (ex.terms && ex.terms.length) {
+      out.push('<div class="why-sec">命中词块（权重 = IDF，越稀有权重越高；次数为该词在文中的出现数）</div>');
+      out.push('<div class="why-chips">' + ex.terms.map(function (t) {
+        return '<span class="chip-term" title="' + esc(t.type || "") + '">' + esc(t.text) +
+          " ×" + t.hits + " <i>w" + t.weight + "</i></span>";
+      }).join("") + "</div>");
+    }
+    if (ex.terms_generic && ex.terms_generic.length) {
+      out.push('<div class="why-sec">被判为 repo 泛词（覆盖 ≥ ' +
+        Math.round((ex.weights && ex.weights.generic_ratio ? ex.weights.generic_ratio : 0.3) * 100) +
+        "% 的文档都有），权重记 0、不参与打分</div>");
+      out.push('<div class="why-chips">' + ex.terms_generic.map(function (t) {
+        return '<span class="chip-term off">' + esc(t) + "</span>";
+      }).join("") + "</div>");
+    }
+    if (ex.terms_missed && ex.terms_missed.length) {
+      out.push('<div class="why-sec">未命中的词块</div>');
+      out.push('<div class="why-chips">' + ex.terms_missed.map(function (t) {
+        return '<span class="chip-term miss">' + esc(t) + "</span>";
+      }).join("") + "</div>");
+    }
+    if (ex.vs_next) {
+      out.push('<div class="why-sec">为什么排在它前面：' + esc(ex.vs_next.path) + "</div>");
+      out.push('<div class="why-sum">综合分差 <b>' + num(ex.vs_next.score_gap, 2) +
+        "</b>，主要来自 " + esc(ex.vs_next.main_reason) + "。</div>");
+    }
+    return out.join("");
+  }
+
+  function ensureWhyDialog() {
+    var dlg = document.getElementById("ln-why");
+    if (dlg) return dlg;
+    dlg = document.createElement("div");
+    dlg.id = "ln-why";
+    dlg.className = "ln-why";
+    dlg.innerHTML = '<div class="ln-why-back"></div><div class="ln-why-box" role="dialog" aria-modal="true">' +
+      '<div class="ln-why-bar"><span class="ln-why-title">判断依据：这条为什么排在这里</span>' +
+      '<button type="button" class="ln-why-close" title="关闭">✕</button></div>' +
+      '<div class="ln-why-body"></div></div>';
+    document.body.appendChild(dlg);
+    dlg.querySelector(".ln-why-back").addEventListener("click", closeWhy);
+    dlg.querySelector(".ln-why-close").addEventListener("click", closeWhy);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") closeWhy();
+    });
+    return dlg;
+  }
+  function closeWhy() {
+    var dlg = document.getElementById("ln-why");
+    if (dlg) dlg.classList.remove("open");
+  }
+  function openWhy(id) {
+    var h = hitStore[id];
+    if (!h) return;
+    var dlg = ensureWhyDialog();
+    dlg.querySelector(".ln-why-body").innerHTML = whyHtml(h);
+    dlg.classList.add("open");
+  }
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest("[data-why]") : null;
+    if (btn) {
+      e.preventDefault();
+      openWhy(btn.getAttribute("data-why"));
+    }
+  });
+
   LN.renderSearchHits = function (hits) {
     hits = hits || [];
+    /* 不重置 hitStore：顶栏弹窗与页面各渲染一次，重置会让先渲染那批的「判断依据」点不动 */
     if (!hits.length) return '<div class="muted">无命中</div>';
     return hits.map(renderHit).join("");
   };
   LN.searchHitEsc = esc;
+  LN.openHitWhy = openWhy;
 })();

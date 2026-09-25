@@ -117,9 +117,13 @@
       </div>
 
       <div class="panel">
-        <h3>代码库索引（本机目录，source=code）</h3>
+        <h3>本机库索引（source=code：代码库根 + 知识库工作区）</h3>
         <div class="row-actions" style="margin-bottom:10px;">
-          <span class="muted">每行一个绝对目录（保存后自动后台重建索引）；命中可按「仅代码库」过滤，结果点开为只读查看。</span>
+          <span class="muted">
+            每行一个绝对目录（保存后自动后台重建索引）；命中按「仅代码库」过滤，点开为只读查看。
+            知识库工作区不在下面配置，改在知识库页设置后于<strong>搜索页「索引管理」手动创建索引</strong>
+            （含 <code>.py</code> 等代码文件，只写本机索引、不上传 depot）。
+          </span>
         </div>
         <textarea class="q" id="code-roots" rows="3"
                   style="width:100%; font-family:Consolas,Menlo,monospace; font-size:12px;"
@@ -128,6 +132,18 @@
           <button class="btn sm primary" type="button" id="btn-code-roots" {% if not is_admin %}title="需要管理员权限" disabled{% endif %}>保存并重建</button>
           <span class="muted" id="code-roots-hint"></span>
         </div>
+        <table class="idx-table" id="code-libs" style="width:100%; border-collapse:collapse; margin-top:10px; font-size:12px;">
+          <thead>
+            <tr>
+              <th style="text-align:left; color:var(--muted);">库</th>
+              <th style="text-align:left; color:var(--muted);">类型</th>
+              <th style="text-align:left; color:var(--muted);">目录</th>
+              <th style="text-align:left; color:var(--muted);">已索引</th>
+              <th style="text-align:left; color:var(--muted);">最近扫描</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
 
       <div class="panel">
@@ -506,7 +522,31 @@
             })
             .catch(function (e) { codeBtn.disabled = false; if (codeHint) codeHint.textContent = "保存失败：" + e; });
         });
+        const codeLibsBody = document.querySelector("#code-libs tbody");
+        function loadCodeLibs() {
+          if (!codeLibsBody) return;
+          fetch(root + "/api/search/index_libs", { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              const rows = (d.libs || []).map(function (lib) {
+                const scan = lib.scan && lib.scan.files
+                  ? lib.scan.files + " 文件 / " + lib.scan.duration_ms + "ms" + (lib.scan.capped ? " / 已截断" : "")
+                  : "—";
+                return "<tr>" +
+                  "<td><code>" + LN.esc(lib.label) + "</code></td>" +
+                  "<td>" + (lib.kind === "kbws" ? "知识库工作区" : "代码库根") + "</td>" +
+                  '<td style="word-break:break-all;">' + LN.esc(lib.root) + (lib.exists ? "" : "（不存在）") + "</td>" +
+                  "<td>" + lib.docs + "</td>" +
+                  "<td>" + LN.esc(scan) + "</td>" +
+                  "</tr>";
+              });
+              codeLibsBody.innerHTML = rows.join("") ||
+                '<tr><td colspan="5" class="muted">暂无本机库（可在下方配置代码库根，或给知识库设工作区）</td></tr>';
+            })
+            .catch(function () {});
+        }
         loadCodeRoots();
+        loadCodeLibs();
 
         load();
       })();

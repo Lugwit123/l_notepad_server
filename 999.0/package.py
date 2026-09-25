@@ -60,6 +60,26 @@ def commands():
     env.L_NOTEPAD_ROOT = "{root}"
     env.PYTHONIOENCODING = "utf-8"
 
+    # rez 源码包货架：搜索页「要搜索哪些包」的勾选来源
+    # （`{root}` = <trayapp>/rez-package-source/<包>/<版本>，向上三级即 trayapp）。
+    # 注意：这里必须把 `{root}` 交给 rez 去展开——先 os.path.abspath 会把 `{root}`
+    # 当普通目录名规范化掉，结果指到 trayapp 的上一级。
+    env.L_NOTEPAD_PKG_ROOT = "{root}/../../../rez-package-source"
+
+    # 本机 cross-encoder 重排服务（llama.cpp llama-server --reranking；启动脚本见
+    # D:/Tools/llama.cpp/start_rerank.bat）。语义召回分数区分度低，重排才分得开候选。
+    # 部署机没有这个服务：连不上会自动降级回原融合排序（不报错、不返回空），
+    # 所以按 Lugwit_deploy 关掉，省掉探活开销（wuwo 常把它设成 "0"，要按真假值判断）。
+    deploy = (getenv("Lugwit_deploy") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not deploy:
+        env.L_NOTEPAD_RERANK_URL = "http://127.0.0.1:11435"
+        # 本机是纯 CPU 交叉编码器（bge-reranker-v2-m3 Q8，实测 ~1.5ms/token）：
+        # 候选数与候选长度直接决定耗时。8 个候选 × 300 字符 ≈ 900 token ≈ 1.2s，
+        # 是「能分得开候选」与「检索不至于等好几秒」之间的折中。
+        env.L_NOTEPAD_RERANK_TOP_N = "8"
+        env.L_NOTEPAD_RERANK_MAX_CHARS = "300"
+        env.L_NOTEPAD_RERANK_TIMEOUT_S = "8"
+
     # 服务端入口（8765，经 nginx /note 反代；本地直连 127.0.0.1:8765）
     alias("l_notepad_api", "python -m l_notepad_server.backend_server")
     # 与 l_notepad_api 相同：热重载已改由进程内 SrcHotReload 统一负责

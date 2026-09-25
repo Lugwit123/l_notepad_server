@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -39,10 +40,10 @@ _TAG_SPLIT = re.compile(r"[,，;；]+")
 
 # 搜索模式说明（/web/search 帮助面板；键顺序即下拉顺序）
 MODE_HELP: dict[str, str] = {
-    "auto": "自动：先用词法搜（毫秒级），一条都没命中时才改用语义兜底。最省心，长句/自然语言推荐。",
-    "lex": "仅词法：倒排索引精确匹配关键词，最快；适合关键词明确，长句可能搜不到。",
-    "hybrid": "混合：词法为主 + 语义加分，召回更广；较慢（本机无 embedding 时可能数秒）。",
-    "sem": "仅语义：按“意思相近”匹配，不看关键词是否出现；可能召回噪声，适合换词也找不到时。",
+    "auto": "自动：先词法搜；命中太少（<3 条）或长句（段数 >4，词法已退化为宽召回）时自动改用混合模式（语义 + 重排）。最省心。",
+    "lex": "仅词法：倒排索引精确匹配关键词，最快；适合关键词明确，长句会退化成宽召回（全部词块 OR）。",
+    "hybrid": "混合：词法为主 + 语义加分 + 重排，召回与排序最好；较慢（含重排约 1s）。",
+    "sem": "仅语义：按“意思相近”匹配，不看关键词是否出现；同 repo 文件区分度低，容易召回噪声。",
 }
 
 
@@ -93,10 +94,13 @@ class SearchHitView:
 
 
 def _hit_view(request: Request, hit: dict[str, Any], brief: list[file_store.FileNote]) -> SearchHitView:
-    """搜索结果 → 模板条目：笔记指向编辑页，知识库工作区指向知识库页并定位文件。"""
+    """搜索结果 → 模板条目：笔记指向编辑页，知识库指向知识库页，本机库指向只读查看页。"""
     rel = str(hit.get("rel") or hit.get("path") or "")
     if hit.get("source") == "kb":
         url = f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={quote(rel, safe='/')}"
+        prefix = f"{hit.get('kb_name') or ''} / "
+    elif hit.get("source") == "code":
+        url = _code_view_url(request, hit)
         prefix = f"{hit.get('kb_name') or ''} / "
     else:
         url = f"{web_base(request)}/{quote(rel, safe='/')}"
@@ -119,14 +123,22 @@ def _hit_view(request: Request, hit: dict[str, Any], brief: list[file_store.File
     )
 
 
+def _code_view_url(request: Request, hit: dict[str, Any]) -> str:
+    """本机库（source=code）命中 → 只读查看页（行号 + 命中词高亮）。"""
+    label = quote(str(hit.get("kb_name") or ""))
+    rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
+    terms = [str(t) for t in list(hit.get("matches") or [])[:8]]
+    url = f"{web_base(request)}/code?root={label}&file={rel}"
+    return url + (f"&hl={quote(','.join(terms))}" if terms else "")
+
+
 def _hit_open_url(request: Request, hit: dict[str, Any]) -> str:
     """命中项的前端打开地址（与 routers/search.py 的 `_open_url` 保持一致）。"""
     rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
     if hit.get("source") == "kb":
         return f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={rel}"
     if hit.get("source") == "code":
-        root = quote(str(hit.get("kb_name") or ""))
-        return f"{mounted_url(request, 'api/search/code/file')}?root={root}&file={rel}"
+        return _code_view_url(request, hit)
     return f"{web_base(request)}/{rel}"
 
 
@@ -236,11 +248,14 @@ def web_search(
     rerank: str = "",
     limit: int = 100,
     offset: int = 0,
+    packages: str = "",
+    pkgs_saved: str = "",
 ) -> HTMLResponse:
-    """独立搜索页：一次搜「个人笔记 + 所有知识库归档」。
+    """独立搜索页：一次搜「个人笔记 + 所有知识库归档 + 本机库（rez 源码包）」。
 
-    参数：`q` 关键词；`mode` auto/lex/hybrid/sem；`sources` note/kb（逗号分隔）；
+    参数：`q` 关键词；`mode` auto/lex/hybrid/sem；`sources` note/kb/code（逗号分隔）；
     `kb` 指定单个知识库（隐含 `sources=kb`）；`rerank` 0/1（受全局配置约束）；
+    `packages` 逗号分隔的 rez 源码包名（只影响代码命中，见 `GET /api/search/code_packages`）；
     `limit`/`offset` 分页。检索一次取到上限（MAX_LIMIT=500）后在服务端切片，便于分面统计。
     """
     templates = get_templates(request)
@@ -249,6 +264,8 @@ def web_search(
     kb_name = (kb or "").strip()
     if kb_name:
         src = ["kb"]
+    pkg_sel = [s.strip() for s in (packages or "").split(",") if s.strip()]
+    pkgs = _packages_ctx(conn, pkg_sel)
     lim = max(1, min(int(limit or 100), 200))
     off = max(0, int(offset or 0))
     m = (mode or "auto").strip().lower()
@@ -273,6 +290,7 @@ def web_search(
     kb_facets: list[dict[str, Any]] = []
     note_count = 0
     kb_count = 0
+    code_count = 0
     shown_end = 0
 
     if query:
@@ -284,6 +302,7 @@ def web_search(
             sources=src or None,
             rerank=rr,
             kb_name=kb_name,
+            packages=pkg_sel or None,
         )
         if m == "auto":
             result = search_index.search_auto(conn, request.app.state.notes_root, query, **common)
@@ -303,6 +322,8 @@ def web_search(
                 kb_count += 1
                 if h.kb_name:
                     counter[h.kb_name] = counter.get(h.kb_name, 0) + 1
+            elif h.source == "code":
+                code_count += 1
             else:
                 note_count += 1
         kb_facets = [
@@ -347,6 +368,11 @@ def web_search(
             "kb_facets": kb_facets,
             "note_count": note_count,
             "kb_count": kb_count,
+            "code_count": code_count,
+            "pkgs": pkgs,
+            "pkgs_sel": ",".join(pkg_sel),
+            "pkgs_saved": pkgs_saved,
+            "index_libs": _index_libs_ctx(conn),
             "limit": lim,
             "offset": off,
             "shown_start": off + 1 if hits else 0,
@@ -361,6 +387,107 @@ def web_search(
 
 
 # ── 笔记列表 / 新建 / 编辑 ──
+
+
+def _packages_ctx(conn: sqlite3.Connection, selected: list[str]) -> dict[str, Any]:
+    """搜索页「要搜索哪些包」勾选列表：**全部本机库**（代码库根 / rez 源码包 / 知识库工作区）。
+
+    任何会被 `packages` 过滤的库都必须在列表里，否则「勾了别的包」就会把它的命中排除掉
+    却没处勾回来（`l_notepad_client` 是代码库根，早期版本只列 rez 包，就踩了这个坑）。
+    `docs > 0` = 已建过索引（能搜到）；`checked` 回显本次请求勾选。
+    """
+    rows = search_index.lib_rows(conn)
+    rows.sort(key=lambda x: (0 if x["kind"] == "code" else 1, x["label"].lower()))
+    picked = set(selected)
+    return {
+        "root": str(search_index.pkg_root(conn) or ""),
+        # 键名不用 `items`：模板里 `pkgs.items` 会先命中 dict.items 方法而不是这个键
+        "catalog": [{**x, "checked": x["label"] in picked} for x in rows],
+        "indexed": len([x for x in rows if x["docs"] > 0]),
+        "total": len(rows),
+    }
+
+
+def _index_libs_ctx(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """搜索页「索引管理」面板数据：本机库 + 已索引文档数 + 最近一次扫描状态。
+
+    只列本机库（代码库根 / 知识库工作区 / rez 源码包）——它们是「手动创建索引」的对象；
+    知识库归档索引走 depot 同步，不在这个面板里点。
+    """
+    return search_index.lib_rows(conn)
+
+
+# 本机库查看页最多渲染的行数（首屏够用；避免几万行的大文件把浏览器卡死）
+_CODE_PAGE_MAX_LINES = 5000
+
+
+@router.get("/web/code", response_class=HTMLResponse)
+def web_code(
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    root: str = "",
+    file: str = "",
+    hl: str = "",
+) -> HTMLResponse:
+    """本机库文件只读查看页（`source=code` 命中项的打开地址）：行号 + 命中词高亮。
+
+    `hl` 为逗号分隔的高亮词（搜索命中项把 matches 带过来）；路径限定在库根内。
+    """
+    templates = get_templates(request)
+    libs = search_index.local_lib_map(conn)
+    label = (root or "").strip()
+    title = (file or "").strip()
+    base = libs.get(label)
+    lines: list[dict[str, Any]] = []
+    error = ""
+    truncated = False
+    total_lines = 0
+    if base is None:
+        error = f"未知的本机库：{label}"
+    elif not title:
+        error = "缺少 file 参数"
+    else:
+        try:
+            target = (base / title).resolve()
+            target.relative_to(base.resolve())
+        except (ValueError, OSError):
+            target, error = None, "非法路径"
+        if target is not None and not target.is_file():
+            error = "文件不存在"
+        elif target is not None:
+            try:
+                text = file_store.read_text_capped(target, search_index.MAX_INDEX_BYTES)
+            except (OSError, ValueError) as exc:
+                error = f"读取失败：{exc}"
+            else:
+                terms = [t.strip() for t in (hl or "").split(",") if t.strip()][:12]
+                rows = text.split("\n")
+                total_lines = len(rows)
+                truncated = total_lines > _CODE_PAGE_MAX_LINES
+                for i, line in enumerate(rows[:_CODE_PAGE_MAX_LINES], 1):
+                    low = line.lower()
+                    hit = [t for t in terms if t.lower() in low]
+                    lines.append({
+                        "no": i,
+                        "hit": bool(hit),
+                        "html": search_index.highlight(line, hit) if hit else escape(line),
+                    })
+    return templates.TemplateResponse(
+        request,
+        "web_code.html",
+        {
+            "root": label,
+            "file": title,
+            "hl": hl,
+            "lines": lines,
+            "error": error,
+            "truncated": truncated,
+            "total_lines": total_lines,
+            "max_lines": _CODE_PAGE_MAX_LINES,
+            "lib_count": len(libs),
+            **template_ctx(request),
+        },
+    )
 
 
 @router.get("/web", response_class=HTMLResponse)

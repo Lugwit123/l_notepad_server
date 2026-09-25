@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}代码查看 - L Notepad{% endblock %}
+{% block page_id %}code{% endblock %}
+{% block page_style %}
+      .cw { max-width: 1400px; margin: 0 auto; padding: 12px 14px 40px; }
+      .cw-head {
+        display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+        padding: 10px 14px; border: 1px solid var(--border); border-radius: 14px;
+        background: var(--panel); box-shadow: var(--shadow);
+      }
+      .cw-head .path { font-family: ui-monospace, Consolas, monospace; font-size: 13px; word-break: break-all; }
+      .cw-head .chip {
+        font-size: 11px; padding: 2px 8px; border-radius: 999px;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .cw-head .chip.lib { color: #8fb6ff; border-color: rgba(91,156,255,.4); }
+      .cw-note { margin: 8px 2px; color: var(--muted); font-size: 12px; }
+      .cw-body {
+        margin-top: 10px; border: 1px solid var(--border); border-radius: 14px;
+        background: #0d1117; overflow: auto; max-height: calc(100vh - 120px);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12.5px; line-height: 1.6;
+      }
+      .cw-line { display: flex; white-space: pre-wrap; word-break: break-word; }
+      .cw-line:hover { background: rgba(91,156,255,0.06); }
+      .cw-line.hit { background: rgba(251, 146, 60, 0.10); }
+      .cw-no {
+        flex: 0 0 auto; min-width: 58px; padding: 0 8px 0 12px; text-align: right;
+        color: rgba(120, 156, 220, 0.38); user-select: none;
+        border-right: 1px solid rgba(80, 120, 220, 0.10);
+      }
+      .cw-text { flex: 1; padding: 0 12px; color: #c9d6e8; }
+      .cw-body mark { background: rgba(251, 146, 60, 0.30); color: #ffd9a3; border-radius: 3px; }
+      .cw-empty { padding: 40px 14px; text-align: center; color: var(--muted); }
+{% endblock %}
+{% block appbar_sub %}本机库文件（只读）{% endblock %}
+{% block body %}
+    <div class="cw">
+      <div class="cw-head">
+        <span class="chip lib">{{ root or "—" }}</span>
+        <span class="path">{{ file or "—" }}</span>
+        {% if hl %}<span class="chip">高亮：{{ hl }}</span>{% endif %}
+        {% if not error %}<span class="chip">共 {{ total_lines }} 行</span>{% endif %}
+      </div>
+      {% if error %}
+      <div class="cw-empty">{{ error }}</div>
+      {% else %}
+      {% if truncated %}
+      <div class="cw-note">文件超过 {{ max_lines }} 行，只渲染前 {{ max_lines }} 行（避免浏览器卡死）。</div>
+      {% endif %}
+      <div class="cw-body">
+        {%- for ln in lines %}
+        <div class="cw-line{% if ln.hit %} hit{% endif %}"><span class="cw-no">{{ ln.no }}</span><span class="cw-text">{{ ln.html|safe }}</span></div>
+        {%- endfor %}
+      </div>
+      {% endif %}
+    </div>
+{% endblock %}

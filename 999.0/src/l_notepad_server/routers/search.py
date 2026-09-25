@@ -18,7 +18,6 @@ from .deps import (
     get_conn,
     get_notes_root,
     is_admin,
-    mounted_url,
     require_admin,
     web_base,
 )
@@ -27,13 +26,15 @@ router = APIRouter(prefix="/api/search", tags=["search"])
 
 
 def _open_url(request: Request, hit: dict[str, Any]) -> str:
-    """命中项的前端打开地址：笔记 → 编辑页；知识库归档 → 知识库页；代码库 → 只读查看。"""
+    """命中项的前端打开地址：笔记 → 编辑页；知识库 → 知识库页；本机库 → 只读查看页。"""
     rel = quote(str(hit.get("rel") or hit.get("path") or ""), safe="/")
     if hit.get("source") == "kb":
         return f"{web_base(request)}/kb/{quote(str(hit.get('kb_name') or ''))}?file={rel}"
     if hit.get("source") == "code":
-        root = quote(str(hit.get("kb_name") or ""))
-        return f"{mounted_url(request, 'api/search/code/file')}?root={root}&file={rel}"
+        label = quote(str(hit.get("kb_name") or ""))
+        terms = [str(t) for t in list(hit.get("matches") or [])[:8]]
+        url = f"{web_base(request)}/code?root={label}&file={rel}"
+        return url + (f"&hl={quote(','.join(terms))}" if terms else "")
     return f"{web_base(request)}/{rel}"
 
 
@@ -48,20 +49,24 @@ def api_search(
     sources: str = "",
     mode: str = "hybrid",
     rerank: Optional[int] = None,
+    packages: str = "",
 ) -> dict[str, Any]:
     """全文检索（倒排索引，毫秒级；权限过滤在 SQL 内完成）。
 
     - 宽召回：中文按 bigram OR 召回，命中短语 > 覆盖率 > bm25 排序；
       查询里用 `"引号"` 包住可要求精确短语。
-    - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库归档），默认全部。
+    - `sources`：逗号分隔的索引源过滤（`note` 个人笔记 / `kb` 知识库归档 / `code` 本机库），默认全部。
     - `mode`：`hybrid`（默认，词法 + 语义加分，词法空时语义兜底）/ `lex`（纯词法）
-      / `sem`（纯语义）/ `auto`（先 `lex`，零命中再回退 `hybrid`；返回多一个 `mode_used`）。
+      / `sem`（纯语义）/ `auto`（先 `lex`，命中太少或长句再回退 `hybrid`；返回多一个 `mode_used`）。
+    - `packages`：逗号分隔的 **rez 源码包名**（见 `GET /api/search/code_packages`），
+      只保留这些包的代码命中（`source=code`）；笔记与知识库不受影响。不传＝不限。
     - `rerank`：`0` 本次不用本地重排、`1` 使用（受全局配置约束），不传用全局配置。
     - 返回 hits：命中的来源、相对路径、打开地址 open_url、摘要、命中词 matches、
       块级信息 chunk / chunk_no / chunk_offset、覆盖率 / 词频 / 近邻 / bm25 / 语义相似度 vec /
       重排分 rerank / 总分 score，以及 rerank 汇总（是否使用 / 模型 / 条数 / 耗时 / 原因）。
     """
     src = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    pkgs = [s.strip() for s in (packages or "").split(",") if s.strip()]
     m = (mode or "hybrid").strip().lower()
     common = dict(
         user=current_user(request),
@@ -70,6 +75,7 @@ def api_search(
         offset=offset,
         sources=src or None,
         rerank=None if rerank is None else bool(rerank),
+        packages=pkgs or None,
     )
     if m == "auto":
         result = search_index.search_auto(conn, notes_root, q, **common)
@@ -88,19 +94,22 @@ def api_route(
     depth: int = 1,
     budget_ms: int = 300,
     limit: int = 10,
-    sources: str = "kb",
+    sources: str = "kb,code",
 ) -> dict[str, Any]:
-    """快速选库：复杂需求 → 相关知识库排序（供 Agent 决定读哪几个库）。
+    """快速选库：复杂需求 → 相关库排序（供 Agent 决定读哪几个库）。
 
     - `depth`：`0` 仅库元数据匹配 / `1` 元数据 + 词法按库聚合（默认）/ `2` 语义加分
       （需求嵌一次与库内文档向量比对；语义不可用自动降级为 `1`）/ `3` 不处理
       （需求分解/多查询请调用方自行完成）。
+    - `sources`：参与选库的来源，默认 `kb,code`（知识库归档 + 本机库：代码库根/知识库工作区）；
+      只想要知识库传 `sources=kb`。
     - 与 `/api/search` 的区别：**不做段间 AND**（长需求不再零命中），且**只查索引表，
       不触发语义探测 / 网络**——毫秒级返回；慢路径一律降级。
     - `budget_ms`：软预算；`< 100` 时 `depth>=2` 自动退回 `1`（语义不做），并回填 `over_budget`。
-    - 返回 `kbs` 按 `score` 降序，`degraded` / `reason` / `reason_code` 说明是否降档及原因。
+    - 返回 `kbs` 按 `score` 降序，`degraded` / `reason` / `reason_code` 说明是否降档及原因；
+      `terms` 为关键词块（含同义扩展），被 IDF 判为泛词剔除的见 `terms_generic_dropped`。
     """
-    src = [s.strip() for s in (sources or "kb").split(",") if s.strip()]
+    src = [s.strip() for s in (sources or "kb,code").split(",") if s.strip()]
     budget = int(budget_ms or 0)
     result = search_index.route(
         conn,
@@ -301,14 +310,116 @@ def api_set_code_roots(
     }
 
 
+@router.get("/code_packages")
+def api_code_packages(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """可勾选搜索的本机库（搜索页「要搜索哪些包」的数据源）。
+
+    含三类：`code` 代码库根（`code_roots` 配的目录，如 `l_notepad_client`）/ `pkg` rez 源码包
+    （货架 `L_NOTEPAD_PKG_ROOT` 下带 `package.py` 的一级目录）/ `kbws` 知识库工作区。
+    `docs` > 0 表示已建过索引（可被搜到）；没建过的要先在搜索页「索引管理」里建
+    （或 `POST /api/search/index_lib`）。
+    """
+    rows = search_index.lib_rows(conn)
+    rows.sort(key=lambda x: (0 if x["kind"] == "code" else 1, x["label"].lower()))
+    root = search_index.pkg_root(conn)
+    return {
+        "root": str(root) if root else "",
+        "packages": [
+            {
+                "label": x["label"],
+                "kind": x["kind"],
+                "root": x["root"],
+                "exists": x["exists"],
+                "docs": x["docs"],
+                "indexed": x["docs"] > 0,
+                "scan": x["scan"],
+            }
+            for x in rows
+        ],
+        "exts": sorted(search_index.CODE_EXTS),
+        "max_files": search_index.CODE_MAX_FILES,
+        "max_bytes": search_index.CODE_MAX_BYTES,
+    }
+
+
+@router.get("/index_libs")
+def api_index_libs(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """可手动建索引的本机库（代码库根 + 知识库工作区）与最近一次扫描状态。
+
+    `kind`：`code` 代码库根（TTL 自动刷新）/ `kbws` 知识库工作区（只在手动建索引时扫）。
+    """
+    state = {str(s["label"]): s for s in search_index.code_lib_state()}
+    docs = {
+        str(r["kb_name"]): int(r["docs"])
+        for r in conn.execute(
+            "SELECT kb_name, COUNT(*) AS docs FROM search_docs WHERE source = 'code' GROUP BY kb_name"
+        )
+    }
+    libs: list[dict[str, Any]] = []
+    for lib in search_index.local_libs(conn):
+        label = str(lib["label"])
+        libs.append({
+            "label": label,
+            "kind": lib["kind"],
+            "name": lib["name"],
+            "root": str(lib["root"]),
+            "exists": bool(lib["exists"]),
+            "docs": docs.get(label, 0),
+            "scan": state.get(label) or {},
+        })
+    return {
+        "libs": libs,
+        "exts": sorted(search_index.CODE_EXTS),
+        "max_files": search_index.CODE_MAX_FILES,
+        "max_bytes": search_index.CODE_MAX_BYTES,
+    }
+
+
+class IndexLibRequest(BaseModel):
+    label: str = ""
+    embed: bool = True
+
+
+@router.post("/index_lib")
+def api_index_lib(
+    payload: IndexLibRequest,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    notes_root: Path = Depends(get_notes_root),
+) -> dict[str, Any]:
+    """手动为一个本机库建索引（管理员）：搜索页「创建索引」调用。
+
+    只扫该库目录（`CODE_EXTS` 过滤 + 体量上限），**不触发 depot 上传**；`embed=True`
+    时随后台向量嵌入线程把这批代码也嵌入（语义检索可用）。
+    """
+    require_admin(request)
+    label = (payload.label or "").strip()
+    if not label:
+        return {"ok": False, "error": "label 不能为空"}
+    try:
+        result = search_index.index_local_lib(conn, label)
+    except KeyError:
+        return {"ok": False, "error": f"未知的本机库：{label}"}
+    embed_started = False
+    if payload.embed:
+        try:
+            embed_started = search_vec.start_embed_async(request.app.state.db_path, notes_root)
+        except Exception:  # noqa: BLE001 - 嵌入失败不影响词法索引
+            embed_started = False
+    return {"ok": True, "embed_started": embed_started, **result}
+
+
 @router.get("/code/file")
 def api_code_file(
     conn: sqlite3.Connection = Depends(get_conn),
     root: str = "",
     file: str = "",
 ) -> PlainTextResponse:
-    """只读查看代码库文件（`source=code` 命中项的打开地址）；路径限定在已配置根内。"""
-    roots = {lb: rp for lb, rp in search_index.code_roots(conn)}
+    """只读查看本机库文件（`source=code` 命中项的打开地址）；路径限定在库根内。
+
+    `root` 为库标签（代码库根或知识库工作区，见 `GET /api/search/index_libs`）。
+    """
+    roots = search_index.local_lib_map(conn)
     base = roots.get(root)
     if base is None:
         return PlainTextResponse("未知代码库: " + root, status_code=404)
